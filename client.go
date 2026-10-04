@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -28,7 +29,9 @@ func GetClient() (*appie.Client, error) {
 // Call this after a successful OAuth login to pick up newly saved tokens.
 func ReloadClient() (*appie.Client, error) {
 	path := TokensPath()
-	c, err := appie.NewWithConfig(path)
+	// BE: data calls must send the Belgian client id (x-client-name header),
+	// otherwise the NL default "appie-ios" is used.
+	c, err := appie.NewWithConfig(path, appie.WithClientID(ahClientID))
 	if err != nil {
 		return nil, fmt.Errorf("create appie client: %w", err)
 	}
@@ -36,4 +39,16 @@ func ReloadClient() (*appie.Client, error) {
 	globalClient = c
 	clientMu.Unlock()
 	return c, nil
+}
+
+// RefreshClientTokens refreshes the in-memory client's access token if it is
+// about to expire. appie-go owns refresh: it saves the rotated tokens to the
+// tokens file and picks up tokens another process saved there, so memory and
+// disk never disagree.
+func RefreshClientTokens(ctx context.Context) error {
+	c, err := GetClient()
+	if err != nil {
+		return err
+	}
+	return c.RefreshIfNeeded(ctx)
 }

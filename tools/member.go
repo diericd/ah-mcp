@@ -19,7 +19,7 @@ func RegisterMemberTools(s *server.MCPServer, deps Deps) {
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil

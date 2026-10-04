@@ -75,8 +75,8 @@ func (c *Cache) Size() int {
 
 // Cache key helpers.
 
-func SearchCacheKey(query string, limit int) string {
-	return fmt.Sprintf("search:%s:%d", query, limit)
+func SearchCacheKey(query string, limit int, includeImages bool) string {
+	return fmt.Sprintf("search:%s:%d:%t", query, limit, includeImages)
 }
 
 func ProductCacheKey(id int) string {
@@ -85,4 +85,15 @@ func ProductCacheKey(id int) string {
 
 func ProductFullCacheKey(id int) string {
 	return fmt.Sprintf("product_full:%d", id)
+}
+
+// Bulk keys are separate because ah_get_products_bulk caches a smaller shape
+// than ah_get_product.
+
+func BulkProductCacheKey(id int) string {
+	return fmt.Sprintf("product_bulk:%d", id)
+}
+
+func BulkProductFullCacheKey(id int) string {
+	return fmt.Sprintf("product_bulk_full:%d", id)
 }

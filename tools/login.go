@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -51,6 +52,8 @@ type Deps struct {
 	StartOAuthFlow func(ctx context.Context) (string, <-chan error, error)
 	// RefreshIfNeeded refreshes the access token if it is close to expiry.
 	RefreshIfNeeded func(ctx context.Context) error
+	// TokenStatus describes the token file at TokensPath (missing, no refresh token, ...). Nil omits it.
+	TokenStatus func() string
 	// Server is the MCP server instance (kept for future use).
 	Server *server.MCPServer
 	// ServerVersion is the build version of the MCP server binary.
@@ -59,8 +62,17 @@ type Deps struct {
 	AppieVersion string
 }
 
-func notAuthResult() *mcp.CallToolResult {
-	return mcp.NewToolResultError(`{"error":"not_authenticated","message":"Not logged in. Call ah_login first."}`)
+func notAuthResult(deps Deps) *mcp.CallToolResult {
+	body := map[string]string{
+		"error":   "not_authenticated",
+		"message": "Not logged in. Call ah_login first.",
+	}
+	if deps.TokenStatus != nil {
+		body["token_path"] = deps.TokensPath
+		body["token_status"] = deps.TokenStatus()
+	}
+	data, _ := json.Marshal(body)
+	return mcp.NewToolResultError(string(data))
 }
 
 func errResult(msg string) *mcp.CallToolResult {

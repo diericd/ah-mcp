@@ -249,7 +249,7 @@ Expect: JSON with id, state, items[], total_price, total_discount
 ```
 Prompt: "What is the total of my AH cart?"
 Tool:   ah_get_cart_summary
-Expect: JSON with TotalItems, TotalPrice, TotalDiscount, DeliveryCost
+Expect: JSON with totalItems (distinct lines), totalPrice, totalDiscount; no delivery cost
 ```
 
 ### 7.4 Update cart item
@@ -280,7 +280,8 @@ Verify: ah_get_cart no longer contains the item
 Prereq: Add some items back to shopping list (step 6.2)
 Prompt: "Move my shopping list to my AH cart"
 Tool:   ah_shopping_list_to_order
-Expect: "Shopping list items added to your online order."
+Expect: JSON with order_id, landed, rejected, qty_mismatch (empty lists omitted), total_items, total_price.
+        No active order: an error with the ah_reopen_order hint.
 Verify: ah_get_cart shows the added items
 ```
 
@@ -327,29 +328,35 @@ Expect: Products sorted by order_count descending
 Note:   Scans both open and closed fulfillments; returns empty if no order history available
 ```
 
-### 8.5 Edit a submitted order ⚠️ UNCONFIRMED
+### 8.5 Edit a submitted order
 ```
-⚠️ UNCONFIRMED: The API calls succeed (reopen → add → revert) but changes did not
-   appear on the AH website or in ah_get_order_details during testing. This may only
-   work on orders in CONFIRMED state (not UNCONFIRMED). Needs further investigation.
-   Do NOT rely on this for real order modifications until confirmed.
+Note:   Earlier runs did reopen → add → revert and saw no change. That is expected:
+        ah_revert_order restores the pre-reopen order and discards the edits.
+        Finish by leaving the order REOPENED and checking out in the AH app.
 
-Prereq: An order from 8.1 where modifiable=true and state=CONFIRMED
+Prereq: An order from 8.1 with modifiable=true and a closing_time in the future
 
 Step A — Reopen:
 Prompt: "Reopen order <order_id> so I can edit it"
 Tool:   ah_reopen_order  order_id=<id>
-Expect: "Order <id> is now unlocked (REOPENED)."
+Expect: "Order <id> is REOPENED. Use ah_update_order_items to edit. ..."
 
 Step B — Update items:
-Prompt: "Add product <id> quantity 2 to the reopened order"
-Tool:   ah_update_order_items  items=[{"product_id":<id>,"quantity":2}]
-Expect: "Order updated: 1 item(s) added/changed, 0 item(s) removed."
+Prompt: "Add product <pid> quantity 2 to order <order_id>"
+Tool:   ah_update_order_items  order_id=<id>  items=[{"product_id":<pid>,"quantity":2}]
+Expect: JSON with order_id=<id> and landed=[{"id":<pid>,"qty":2}].
+        A product the delivery slot drops shows up in rejected instead.
+        total_items counts distinct product lines, not units.
+Verify: ah_get_order_details order_id=<id> lists the product
 
-Step C — Revert (ALWAYS required, even if editing failed):
-Prompt: "Resubmit order <order_id>"
-Tool:   ah_revert_order  order_id=<id>
-Expect: "Order <id> has been resubmitted. Your delivery is back on schedule."
+Step C — Wrong order active:
+Prereq: Another order is active (reopened in the app)
+Tool:   ah_update_order_items  order_id=<id>  items=[...]
+Expect: order <id> is reopened first (reopened_order_id=<id>) and written;
+        if the reopen fails, a tool error and nothing is written to the other order
+
+Step D — Leave it REOPENED for review in the app. Only call
+        ah_revert_order order_id=<id> to abort: it discards every edit since Step A.
 ```
 
 ---
@@ -407,7 +414,7 @@ Expect: URL → browser login → "Login successful! Connected as <Name>."
 | Shopping list | ah_check_shopping_list_item | ⚠️ broken (listItemId=0) |
 | Cart | ah_get_cart, ah_get_cart_summary, ah_update_cart_item, ah_remove_from_cart, ah_clear_cart | ✅ |
 | Order history | ah_get_order_history, ah_get_past_orders, ah_get_order_details, ah_get_frequent_items | ✅ |
-| Order editing | ah_reopen_order, ah_update_order_items, ah_revert_order | ⚠️ unconfirmed |
+| Order editing | ah_reopen_order, ah_update_order_items, ah_revert_order | ⚠️ see 8.5 |
 | Receipts | ah_get_receipts, ah_get_receipt_details | ✅ |
 
 **Total: 28 tools**

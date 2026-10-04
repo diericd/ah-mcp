@@ -64,6 +64,7 @@ func main() {
 	callbackPort := envIntOr("AH_CALLBACK_PORT", defaultCallbackPort)
 	mcpPort := envIntOr("AH_MCP_PORT", defaultMCPPort)
 	tokensPath := TokensPath()
+	fmt.Fprintf(os.Stderr, "[Albert Heijn MCP] Tokens: %s\n", TokenStatus(tokensPath))
 
 	// Ensure token directory exists with secure permissions.
 	if err := ensureTokenDir(tokensPath); err != nil {
@@ -85,16 +86,17 @@ func main() {
 		RemoteMode:    *remote,
 		ServerVersion: version,
 		AppieVersion:  appieVersion(),
-		GetClient:    GetClient,
-		ReloadClient: ReloadClient,
+		GetClient:     GetClient,
+		ReloadClient:  ReloadClient,
 		IsAuthenticated: func() bool {
 			return IsAuthenticated(tokensPath)
 		},
 		StartOAuthFlow: func(ctx context.Context) (string, <-chan error, error) {
 			return StartOAuthFlow(ctx, callbackHost, callbackPort, tokensPath)
 		},
-		RefreshIfNeeded: func(ctx context.Context) error {
-			return RefreshIfNeeded(ctx, tokensPath)
+		RefreshIfNeeded: RefreshClientTokens,
+		TokenStatus: func() string {
+			return TokenStatus(tokensPath)
 		},
 		Server: s,
 	}
