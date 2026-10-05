@@ -408,7 +408,9 @@ func splitPrice(p appie.Product) (price, bonusPrice float64) {
 		return p.Price.Now, 0
 	}
 	if p.Price.Was == 0 {
-		return p.Price.Now, p.Price.Now
+		// Deals like "VOOR 1.39" come without a was price: the bonus price is
+		// only in the mechanism text.
+		return p.Price.Now, 0
 	}
 	return p.Price.Was, p.Price.Now
 }
@@ -423,6 +425,7 @@ type bulkProduct struct {
 	BonusPrice       float64     `json:"bonus_price,omitempty"`
 	UnitSize         string      `json:"unit_size,omitempty"`
 	IsBonus          bool        `json:"is_bonus"`
+	BonusMechanism   string      `json:"bonus_mechanism,omitempty"`
 	NutriScore       string      `json:"nutri_score,omitempty"`
 	IsAvailable      bool        `json:"is_available"`
 	IsOrderable      bool        `json:"is_orderable"`
@@ -440,6 +443,7 @@ func newBulkProduct(p *appie.Product, includeNutri bool) bulkProduct {
 		Category:         p.Category,
 		UnitSize:         p.UnitSize,
 		IsBonus:          p.IsBonus,
+		BonusMechanism:   p.BonusMechanism,
 		NutriScore:       p.NutriScore,
 		IsAvailable:      p.IsAvailable,
 		IsOrderable:      p.IsOrderable,
@@ -922,15 +926,7 @@ func registerGetProduct(s *server.MCPServer, deps Deps) {
 			UnitPriceDescription: p.UnitPriceDescription,
 			PropertyIcons:        p.PropertyIcons,
 		}
-		if p.IsBonus {
-			r.BonusPrice = p.Price.Now
-			r.Price = p.Price.Was
-			if r.Price == 0 {
-				r.Price = p.Price.Now
-			}
-		} else {
-			r.Price = p.Price.Now
-		}
+		r.Price, r.BonusPrice = splitPrice(*p)
 		if len(p.Images) > 0 {
 			r.ImageURL = p.Images[0].URL
 		}

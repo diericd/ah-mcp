@@ -103,7 +103,6 @@ func registerGetOrderHistory(s *server.MCPServer, deps Deps) {
 				Status:       f.StatusDescription,
 				StatusCode:   f.StatusCode,
 				Cancelled:    isCancelledStatus(f.StatusDescription, f.Delivery.Status),
-				Delivered:    f.TransactionCompleted,
 				ShoppingType: f.ShoppingType,
 				Modifiable:   f.Modifiable,
 				Reopenable:   f.Reopenable,
@@ -169,6 +168,9 @@ func registerGetPastOrders(s *server.MCPServer, deps Deps) {
 			if i >= limit {
 				break
 			}
+			// transactionCompleted is true on open and cancelled orders too, so a
+			// closed order counts as delivered unless it was cancelled.
+			cancelled := isCancelledStatus(f.StatusDescription, f.Delivery.Status)
 			results = append(results, orderEntry{
 				ID:           f.OrderID,
 				Date:         f.Delivery.Slot.Date,
@@ -177,8 +179,8 @@ func registerGetPastOrders(s *server.MCPServer, deps Deps) {
 				TotalPrice:   f.TotalPrice.TotalPrice.Amount,
 				Status:       f.StatusDescription,
 				StatusCode:   f.StatusCode,
-				Cancelled:    isCancelledStatus(f.StatusDescription, f.Delivery.Status),
-				Delivered:    f.TransactionCompleted,
+				Cancelled:    cancelled,
+				Delivered:    !cancelled,
 				ShoppingType: f.ShoppingType,
 			})
 		}

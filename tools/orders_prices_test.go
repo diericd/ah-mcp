@@ -39,7 +39,7 @@ func pricesServer(t *testing.T, detailsOK bool) *httptest.Server {
 					"orderId":              id,
 					"statusCode":           map[bool]int{true: 9, false: 2}[closed],
 					"statusDescription":    map[bool]string{true: "Geannuleerd", false: "Ingediend"}[closed],
-					"transactionCompleted": false,
+					"transactionCompleted": true, // live AH sets this on open and cancelled orders too
 					"totalPrice":           map[string]any{"totalPrice": map[string]any{"amount": amount}},
 					"delivery":             map[string]any{"status": "SUBMITTED", "slot": slot},
 				}}}},
