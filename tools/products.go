@@ -407,10 +407,10 @@ func splitPrice(p appie.Product) (price, bonusPrice float64) {
 	if !p.IsBonus {
 		return p.Price.Now, 0
 	}
-	if p.Price.Was == 0 {
-		// Deals like "VOOR 1.39" come without a was price: the bonus price is
-		// only in the mechanism text.
-		return p.Price.Now, 0
+	if p.Price.Was == 0 || p.Price.Was <= p.Price.Now {
+		// Deals like "VOOR 1.39" or "2 voor 2.99" come without a lower now
+		// price: the bonus price is only in the mechanism text.
+		return max(p.Price.Now, p.Price.Was), 0
 	}
 	return p.Price.Was, p.Price.Now
 }

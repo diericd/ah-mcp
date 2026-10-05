@@ -43,21 +43,23 @@ func TestNewBulkProductFlagsAndIcons(t *testing.T) {
 	}
 }
 
-// A "VOOR 1.39"-style deal arrives without a was price: the bonus price is unknown,
-// so bonus_price must not repeat the regular price.
+// A "VOOR 1.39"-style deal arrives without a lower now price (was is 0 or equal),
+// so the bonus price is unknown and bonus_price must not repeat the regular price.
 func TestBonusDealWithoutWasPrice(t *testing.T) {
-	p := appie.Product{ID: 115513, Title: "Peer", IsBonus: true, BonusMechanism: "VOOR 1.39", Price: appie.Price{Now: 1.99}}
-	for name, v := range map[string]any{"item": newProductItem(p, false), "bulk": newBulkProduct(&p, false)} {
-		got, err := json.Marshal(v)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if strings.Contains(string(got), `"bonus_price"`) {
-			t.Errorf("%s: bonus_price should be omitted in %s", name, got)
-		}
-		for _, want := range []string{`"price":1.99`, `"bonus_mechanism":"VOOR 1.39"`} {
-			if !strings.Contains(string(got), want) {
-				t.Errorf("%s: missing %s in %s", name, want, got)
+	for _, price := range []appie.Price{{Now: 1.99}, {Now: 1.99, Was: 1.99}} {
+		p := appie.Product{ID: 115513, Title: "Peer", IsBonus: true, BonusMechanism: "VOOR 1.39", Price: price}
+		for name, v := range map[string]any{"item": newProductItem(p, false), "bulk": newBulkProduct(&p, false)} {
+			got, err := json.Marshal(v)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(got), `"bonus_price"`) {
+				t.Errorf("%s: bonus_price should be omitted in %s", name, got)
+			}
+			for _, want := range []string{`"price":1.99`, `"bonus_mechanism":"VOOR 1.39"`} {
+				if !strings.Contains(string(got), want) {
+					t.Errorf("%s: missing %s in %s", name, want, got)
+				}
 			}
 		}
 	}
