@@ -227,7 +227,7 @@ func registerAddFreeTextToShoppingList(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Failed to add free-text item '%s': %v", name, err)), nil
 		}
 		if !verified {
-			return mcp.NewToolResultText(fmt.Sprintf("NOT VERIFIED: AH accepted '%s' but the list read-back shows no new or increased free-text line with that name; treat it as not added.", name)), nil
+			return mcp.NewToolResultText(fmt.Sprintf("NOT VERIFIED: AH accepted '%s' but the list read-back shows no free-text line with that name at that quantity; treat it as not added.", name)), nil
 		}
 		return mcp.NewToolResultText(fmt.Sprintf("Added '%s' (x%d) to shopping list (verified on read-back).", name, quantity)), nil
 	})
