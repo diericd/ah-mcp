@@ -431,6 +431,8 @@ type bulkProduct struct {
 	IsOrderable      bool        `json:"is_orderable"`
 	PreviouslyBought bool        `json:"previously_bought,omitempty"`
 	PropertyIcons    []string    `json:"property_icons,omitempty"`
+	Description      string      `json:"description,omitempty"`
+	ZelfToevoegen    string      `json:"zelf_toevoegen,omitempty"`
 	NutritionalInfo  interface{} `json:"nutritional_info,omitempty"`
 	Error            string      `json:"error,omitempty"`
 }
@@ -449,6 +451,8 @@ func newBulkProduct(p *appie.Product, includeNutri bool) bulkProduct {
 		IsOrderable:      p.IsOrderable,
 		PreviouslyBought: p.IsPreviouslyBought,
 		PropertyIcons:    p.PropertyIcons,
+		Description:      p.ShortDescription,
+		ZelfToevoegen:    p.SelfAdd,
 	}
 	pr.Price, pr.BonusPrice = splitPrice(*p)
 	if includeNutri && len(p.NutritionalInfo) > 0 {
@@ -603,7 +607,8 @@ func registerGetProductsBulk(s *server.MCPServer, deps Deps) {
 			"Get details for multiple products by ID in one tool call. "+
 				"Use instead of calling ah_get_product repeatedly — saves tool-call quota. "+
 				"Optionally include nutritional info (calories, fat, protein, etc.) for all products. "+
-				"Returns the same availability flags and property_icons as ah_get_product. "+
+				"Returns the same availability flags and property_icons as ah_get_product, plus description "+
+				"and zelf_toevoegen (a meal kit's 'Zelf toevoegen' text: the extras to buy). "+
 				"Max 20 product IDs per call.",
 		),
 		mcp.WithArray("product_ids",
@@ -907,6 +912,7 @@ func registerGetProduct(s *server.MCPServer, deps Deps) {
 			IsOrderable          bool        `json:"is_orderable"`
 			PreviouslyBought     bool        `json:"previously_bought,omitempty"`
 			PropertyIcons        []string    `json:"property_icons,omitempty"`
+			ZelfToevoegen        string      `json:"zelf_toevoegen,omitempty"`
 			NutritionalInfo      interface{} `json:"nutritional_info,omitempty"`
 			ImageURL             string      `json:"image_url,omitempty"`
 		}
@@ -925,6 +931,7 @@ func registerGetProduct(s *server.MCPServer, deps Deps) {
 			UnitSize:             p.UnitSize,
 			UnitPriceDescription: p.UnitPriceDescription,
 			PropertyIcons:        p.PropertyIcons,
+			ZelfToevoegen:        p.SelfAdd,
 		}
 		r.Price, r.BonusPrice = splitPrice(*p)
 		if len(p.Images) > 0 {

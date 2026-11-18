@@ -236,3 +236,30 @@ func TestGetProductNotServedFromBulkCache(t *testing.T) {
 		t.Errorf("ah_get_product returned the bulk shape: %s", text)
 	}
 }
+
+func TestGetProductsBulkReturnsKitSelfAdd(t *testing.T) {
+	GlobalCache.Invalidate("product_bulk:")
+	t.Cleanup(func() { GlobalCache.Invalidate("product_bulk:") })
+	h := func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]map[string]any{{
+			"webshopId": 564214, "title": "AH Gesneden verspakket Koreaanse bowl kip", "availableOnline": true,
+			"descriptionHighlights": "<p>Koreaanse bowl.</p><p><ul><li>voor 2-3 personen||Zelf toevoegen: 195 g kipdijfilet, 4 el mayonaise</li></ul></p>",
+		}})
+	}
+	text := runProductTool(t, h, registerGetProductsBulk, "ah_get_products_bulk",
+		map[string]any{"product_ids": []any{float64(564214)}})
+
+	var got []bulkProduct
+	if err := json.Unmarshal([]byte(text), &got); err != nil {
+		t.Fatalf("decode %q: %v", text, err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d results: %s", len(got), text)
+	}
+	if got[0].ZelfToevoegen != "195 g kipdijfilet, 4 el mayonaise" {
+		t.Errorf("zelf_toevoegen = %q", got[0].ZelfToevoegen)
+	}
+	if got[0].Description != "Koreaanse bowl.\nvoor 2-3 personen\nZelf toevoegen: 195 g kipdijfilet, 4 el mayonaise" {
+		t.Errorf("description = %q", got[0].Description)
+	}
+}
