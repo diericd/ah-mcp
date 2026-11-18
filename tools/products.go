@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -37,19 +39,23 @@ func registerSearchProducts(s *server.MCPServer, deps Deps) {
 				"AH is a Dutch supermarket so prefer Dutch search terms for best results: "+
 				"e.g. 'melk' (milk), 'kaas' (cheese), 'brood' (bread), 'kip' (chicken), 'appel' (apple). "+
 				"English terms also work but may return fewer results. "+
-				"Returns id, title, price, bonus_price, unit, is_bonus, image_url.",
+				"Returns id, title, price, bonus_price, unit, is_bonus, bonus_mechanism, is_available, is_orderable, previously_bought (omitted when false), and image_url when include_images=true. "+
+				"Neither is_available nor is_orderable guarantees the item is in stock for the delivery slot.",
 		),
 		mcp.WithString("query",
 			mcp.Required(),
 			mcp.Description("Search query in Dutch or English, e.g. 'melk', 'cola', 'pindakaas', 'chicken'"),
 		),
-		mcp.WithString("limit",
+		mcp.WithNumber("limit",
 			mcp.Description("Maximum number of results to return (default 10, max 30)"),
+		),
+		mcp.WithBoolean("include_images",
+			mcp.Description("Set to true to include image_url in each result (default false)"),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -63,10 +69,14 @@ func registerSearchProducts(s *server.MCPServer, deps Deps) {
 		if query == "" {
 			return errResult("query is required"), nil
 		}
-		limit := req.GetInt("limit", 10)
+		limit, err := argInt(req, "limit", 10)
+		if err != nil {
+			return errResult(err.Error()), nil
+		}
+		includeImages := req.GetBool("include_images", false)
 		start := time.Now()
 
-		cacheKey := SearchCacheKey(query, limit)
+		cacheKey := SearchCacheKey(query, limit, includeImages)
 		if cached, ok := GlobalCache.Get(cacheKey); ok {
 			LogInfo("ah_search_products", "cache_hit query=%q duration=%v", query, time.Since(start))
 			return mcp.NewToolResultText(string(cached)), nil
@@ -82,42 +92,18 @@ func registerSearchProducts(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Search failed: %v", err)), nil
 		}
 
-		type item struct {
-			ID         int     `json:"id"`
-			Title      string  `json:"title"`
-			Price      float64 `json:"price"`
-			BonusPrice float64 `json:"bonus_price,omitempty"`
-			Unit       string  `json:"unit,omitempty"`
-			IsBonus    bool    `json:"is_bonus"`
-			ImageURL   string  `json:"image_url,omitempty"`
-		}
-		results := make([]item, 0, len(products))
+		results := make([]productItem, 0, len(products))
 		for _, p := range products {
-			it := item{
-				ID:      p.ID,
-				Title:   p.Title,
-				Price:   p.Price.Was,
-				IsBonus: p.IsBonus,
-				Unit:    p.UnitSize,
-			}
-			if p.IsBonus {
-				it.BonusPrice = p.Price.Now
-				if it.Price == 0 {
-					it.Price = p.Price.Now
-				}
-			} else {
-				it.Price = p.Price.Now
-			}
-			if len(p.Images) > 0 {
-				it.ImageURL = p.Images[0].URL
-			}
-			results = append(results, it)
+			results = append(results, newProductItem(p, includeImages))
 		}
-		data, err := json.MarshalIndent(results, "", "  ")
+		data, err := json.Marshal(results)
 		if err != nil {
 			return errResult(fmt.Sprintf("marshal result: %v", err)), nil
 		}
-		GlobalCache.Set(cacheKey, data, CacheTTLSearch)
+		// An empty result may be transient, so it is never cached.
+		if len(results) > 0 {
+			GlobalCache.Set(cacheKey, data, CacheTTLSearch)
+		}
 		LogInfo("ah_search_products", "query=%q results=%d duration=%v", query, len(results), time.Since(start))
 		return mcp.NewToolResultText(string(data)), nil
 	})
@@ -138,10 +124,13 @@ func registerGetBonusGroupProducts(s *server.MCPServer, deps Deps) {
 			mcp.Required(),
 			mcp.Description("Bonus segment ID from the bonus_segment_id field in ah_get_bonus_offers"),
 		),
+		mcp.WithBoolean("include_images",
+			mcp.Description("Set to true to include image_url in each result (default false)"),
+		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -161,38 +150,10 @@ func registerGetBonusGroupProducts(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Failed to get bonus group products for %s: %v", segmentID, err)), nil
 		}
 
-		type item struct {
-			ID             int     `json:"id"`
-			Title          string  `json:"title"`
-			Price          float64 `json:"price"`
-			BonusPrice     float64 `json:"bonus_price,omitempty"`
-			Unit           string  `json:"unit,omitempty"`
-			IsBonus        bool    `json:"is_bonus"`
-			BonusMechanism string  `json:"bonus_mechanism,omitempty"`
-			ImageURL       string  `json:"image_url,omitempty"`
-		}
-		results := make([]item, 0, len(products))
+		includeImages := req.GetBool("include_images", false)
+		results := make([]productItem, 0, len(products))
 		for _, p := range products {
-			it := item{
-				ID:             p.ID,
-				Title:          p.Title,
-				IsBonus:        p.IsBonus,
-				Unit:           p.UnitSize,
-				BonusMechanism: p.BonusMechanism,
-			}
-			if p.IsBonus {
-				it.BonusPrice = p.Price.Now
-				it.Price = p.Price.Was
-				if it.Price == 0 {
-					it.Price = p.Price.Now
-				}
-			} else {
-				it.Price = p.Price.Now
-			}
-			if len(p.Images) > 0 {
-				it.ImageURL = p.Images[0].URL
-			}
-			results = append(results, it)
+			results = append(results, newProductItem(p, includeImages))
 		}
 		return jsonResult(results)
 	})
@@ -211,7 +172,7 @@ func registerGetBonusOffers(s *server.MCPServer, deps Deps) {
 				"pass that to ah_get_bonus_group_products to see the individual products in the group. "+
 				"Returns id, bonus_segment_id, title, original_price, bonus_price, discount_percentage, bonus_mechanism.",
 		),
-		mcp.WithString("limit",
+		mcp.WithNumber("limit",
 			mcp.Description("Maximum number of results to return (default 20)"),
 		),
 		mcp.WithString("query",
@@ -220,7 +181,7 @@ func registerGetBonusOffers(s *server.MCPServer, deps Deps) {
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -230,7 +191,10 @@ func registerGetBonusOffers(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Client error: %v", err)), nil
 		}
 
-		limit := req.GetInt("limit", 20)
+		limit, err := argInt(req, "limit", 20)
+		if err != nil {
+			return errResult(err.Error()), nil
+		}
 		query := strings.ToLower(req.GetString("query", ""))
 
 		// GetBonusProducts fetches all categories and fails if any one errors.
@@ -271,9 +235,7 @@ func registerGetBonusOffers(s *server.MCPServer, deps Deps) {
 				BonusPrice:     p.Price.Now,
 				BonusMechanism: p.BonusMechanism,
 			}
-			if p.Price.Was > 0 && p.Price.Now > 0 {
-				it.DiscountPercentage = (1 - p.Price.Now/p.Price.Was) * 100
-			}
+			it.DiscountPercentage = discountPercentage(p.Price.Was, p.Price.Now)
 			results = append(results, it)
 		}
 		return jsonResult(results)
@@ -290,10 +252,10 @@ func registerGetLastChanceItems(s *server.MCPServer, deps Deps) {
 				"Requires a store_id (use ah_search_products to find stores, or provide postal_code to find the nearest store). "+
 				"Uses the dedicated bargainItems GraphQL endpoint which returns today-only markdown deals.",
 		),
-		mcp.WithString("limit",
+		mcp.WithNumber("limit",
 			mcp.Description("Maximum number of results to return (default 20)"),
 		),
-		mcp.WithString("store_id",
+		mcp.WithNumber("store_id",
 			mcp.Description("AH store ID (integer). Required to retrieve bargain items."),
 		),
 		mcp.WithString("postal_code",
@@ -302,7 +264,7 @@ func registerGetLastChanceItems(s *server.MCPServer, deps Deps) {
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -312,8 +274,14 @@ func registerGetLastChanceItems(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Client error: %v", err)), nil
 		}
 
-		limit := req.GetInt("limit", 20)
-		storeID := req.GetInt("store_id", 0)
+		limit, err := argInt(req, "limit", 20)
+		if err != nil {
+			return errResult(err.Error()), nil
+		}
+		storeID, err := argInt(req, "store_id", 0)
+		if err != nil {
+			return errResult(err.Error()), nil
+		}
 
 		// If store_id not provided, try to resolve from postal_code.
 		if storeID == 0 {
@@ -388,9 +356,114 @@ func registerGetLastChanceItems(s *server.MCPServer, deps Deps) {
 	})
 }
 
-// jsonResult marshals v and wraps it in a CallToolResult.
+// productItem is the product shape returned by the search and bonus-group tools.
+// is_available maps availableOnline and is_orderable maps isOrderable. Neither
+// is proven to catch items that are sold out for the delivery slot.
+type productItem struct {
+	ID               int     `json:"id"`
+	Title            string  `json:"title"`
+	Price            float64 `json:"price"`
+	BonusPrice       float64 `json:"bonus_price,omitempty"`
+	Unit             string  `json:"unit,omitempty"`
+	IsBonus          bool    `json:"is_bonus"`
+	BonusMechanism   string  `json:"bonus_mechanism,omitempty"`
+	IsAvailable      bool    `json:"is_available"`
+	IsOrderable      bool    `json:"is_orderable"`
+	PreviouslyBought bool    `json:"previously_bought,omitempty"`
+	ImageURL         string  `json:"image_url,omitempty"`
+}
+
+// newProductItem builds a productItem. Image URLs are long and rarely needed,
+// so they are only included when includeImages is set.
+func newProductItem(p appie.Product, includeImages bool) productItem {
+	it := productItem{
+		ID:               p.ID,
+		Title:            p.Title,
+		Unit:             p.UnitSize,
+		IsBonus:          p.IsBonus,
+		BonusMechanism:   p.BonusMechanism,
+		IsAvailable:      p.IsAvailable,
+		IsOrderable:      p.IsOrderable,
+		PreviouslyBought: p.IsPreviouslyBought,
+	}
+	it.Price, it.BonusPrice = splitPrice(p)
+	if includeImages && len(p.Images) > 0 {
+		it.ImageURL = p.Images[0].URL
+	}
+	return it
+}
+
+// discountPercentage returns the discount from was to now in percent, rounded
+// to 2 decimals, or 0 when either price is unknown.
+func discountPercentage(was, now float64) float64 {
+	if was <= 0 || now <= 0 {
+		return 0
+	}
+	return math.Round((1-now/was)*10000) / 100
+}
+
+// splitPrice returns the regular price and, for bonus products, the bonus price.
+func splitPrice(p appie.Product) (price, bonusPrice float64) {
+	if !p.IsBonus {
+		return p.Price.Now, 0
+	}
+	if p.Price.Was == 0 || p.Price.Was <= p.Price.Now {
+		// Deals like "VOOR 1.39" or "2 voor 2.99" come without a lower now
+		// price: the bonus price is only in the mechanism text.
+		return max(p.Price.Now, p.Price.Was), 0
+	}
+	return p.Price.Was, p.Price.Now
+}
+
+// bulkProduct is one entry of the ah_get_products_bulk result.
+type bulkProduct struct {
+	ID               int         `json:"id"`
+	Title            string      `json:"title"`
+	Brand            string      `json:"brand,omitempty"`
+	Category         string      `json:"category,omitempty"`
+	Price            float64     `json:"price"`
+	BonusPrice       float64     `json:"bonus_price,omitempty"`
+	UnitSize         string      `json:"unit_size,omitempty"`
+	IsBonus          bool        `json:"is_bonus"`
+	BonusMechanism   string      `json:"bonus_mechanism,omitempty"`
+	NutriScore       string      `json:"nutri_score,omitempty"`
+	IsAvailable      bool        `json:"is_available"`
+	IsOrderable      bool        `json:"is_orderable"`
+	PreviouslyBought bool        `json:"previously_bought,omitempty"`
+	PropertyIcons    []string    `json:"property_icons,omitempty"`
+	Description      string      `json:"description,omitempty"`
+	ZelfToevoegen    string      `json:"zelf_toevoegen,omitempty"`
+	NutritionalInfo  interface{} `json:"nutritional_info,omitempty"`
+	Error            string      `json:"error,omitempty"`
+}
+
+func newBulkProduct(p *appie.Product, includeNutri bool) bulkProduct {
+	pr := bulkProduct{
+		ID:               p.ID,
+		Title:            p.Title,
+		Brand:            p.Brand,
+		Category:         p.Category,
+		UnitSize:         p.UnitSize,
+		IsBonus:          p.IsBonus,
+		BonusMechanism:   p.BonusMechanism,
+		NutriScore:       p.NutriScore,
+		IsAvailable:      p.IsAvailable,
+		IsOrderable:      p.IsOrderable,
+		PreviouslyBought: p.IsPreviouslyBought,
+		PropertyIcons:    p.PropertyIcons,
+		Description:      p.ShortDescription,
+		ZelfToevoegen:    p.SelfAdd,
+	}
+	pr.Price, pr.BonusPrice = splitPrice(*p)
+	if includeNutri && len(p.NutritionalInfo) > 0 {
+		pr.NutritionalInfo = p.NutritionalInfo
+	}
+	return pr
+}
+
+// jsonResult marshals v as compact JSON and wraps it in a CallToolResult.
 func jsonResult(v any) (*mcp.CallToolResult, error) {
-	data, err := json.MarshalIndent(v, "", "  ")
+	data, err := json.Marshal(v)
 	if err != nil {
 		return errResult(fmt.Sprintf("marshal result: %v", err)), nil
 	}
@@ -413,17 +486,21 @@ func registerSearchProductsBulk(s *server.MCPServer, deps Deps) {
 				"Use this instead of calling ah_search_products repeatedly — saves tool-call quota. "+
 				"Max 10 queries per call. Dutch terms give best results.",
 		),
-		mcp.WithString("queries",
+		mcp.WithArray("queries",
 			mcp.Required(),
-			mcp.Description(`JSON array of search queries, e.g. ["melk", "kaas", "brood", "kip"]`),
+			mcp.Description(`Search queries, e.g. ["melk", "kaas", "brood", "kip"]`),
+			mcp.WithStringItems(),
 		),
-		mcp.WithString("limit",
+		mcp.WithNumber("limit",
 			mcp.Description("Max results per query (default 5, max 10)"),
+		),
+		mcp.WithBoolean("include_images",
+			mcp.Description("Set to true to include image_url in each result (default false)"),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -433,21 +510,9 @@ func registerSearchProductsBulk(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Client error: %v", err)), nil
 		}
 
-		var queries []string
-		rawQ := req.GetArguments()["queries"]
-		switch v := rawQ.(type) {
-		case string:
-			if err := json.Unmarshal([]byte(v), &queries); err != nil {
-				return errResult(fmt.Sprintf("queries must be a JSON array: %v", err)), nil
-			}
-		case []any:
-			for _, q := range v {
-				if s, ok := q.(string); ok && s != "" {
-					queries = append(queries, s)
-				}
-			}
-		default:
-			return errResult("queries is required"), nil
+		queries, err := parseStringArray("queries", req.GetArguments()["queries"])
+		if err != nil {
+			return errResult(err.Error()), nil
 		}
 		if len(queries) == 0 {
 			return errResult("queries array is empty"), nil
@@ -456,24 +521,21 @@ func registerSearchProductsBulk(s *server.MCPServer, deps Deps) {
 			queries = queries[:10]
 		}
 
-		limit := req.GetInt("limit", 5)
+		limit, err := argInt(req, "limit", 5)
+		if err != nil {
+			return errResult(err.Error()), nil
+		}
 		if limit > 10 {
 			limit = 10
 		}
+		includeImages := req.GetBool("include_images", false)
 
 		start := time.Now()
 
 		type searchResult struct {
-			Query   string `json:"query"`
-			Results []struct {
-				ID         int     `json:"id"`
-				Title      string  `json:"title"`
-				Price      float64 `json:"price"`
-				BonusPrice float64 `json:"bonus_price,omitempty"`
-				Unit       string  `json:"unit,omitempty"`
-				IsBonus    bool    `json:"is_bonus"`
-			} `json:"results"`
-			Error string `json:"error,omitempty"`
+			Query   string        `json:"query"`
+			Results []productItem `json:"results"`
+			Error   string        `json:"error,omitempty"`
 		}
 
 		results := make([]searchResult, len(queries))
@@ -494,16 +556,9 @@ func registerSearchProductsBulk(s *server.MCPServer, deps Deps) {
 				defer func() { <-sem }()
 
 				// Check cache first.
-				cacheKey := SearchCacheKey(q, limit)
+				cacheKey := SearchCacheKey(q, limit, includeImages)
 				if cached, ok := GlobalCache.Get(cacheKey); ok {
-					var items []struct {
-						ID         int     `json:"id"`
-						Title      string  `json:"title"`
-						Price      float64 `json:"price"`
-						BonusPrice float64 `json:"bonus_price,omitempty"`
-						Unit       string  `json:"unit,omitempty"`
-						IsBonus    bool    `json:"is_bonus"`
-					}
+					var items []productItem
 					if json.Unmarshal(cached, &items) == nil {
 						results[i].Results = items
 						return
@@ -520,37 +575,17 @@ func registerSearchProductsBulk(s *server.MCPServer, deps Deps) {
 					return
 				}
 
-				items := make([]struct {
-					ID         int     `json:"id"`
-					Title      string  `json:"title"`
-					Price      float64 `json:"price"`
-					BonusPrice float64 `json:"bonus_price,omitempty"`
-					Unit       string  `json:"unit,omitempty"`
-					IsBonus    bool    `json:"is_bonus"`
-				}, 0, len(products))
+				items := make([]productItem, 0, len(products))
 				for _, p := range products {
-					it := struct {
-						ID         int     `json:"id"`
-						Title      string  `json:"title"`
-						Price      float64 `json:"price"`
-						BonusPrice float64 `json:"bonus_price,omitempty"`
-						Unit       string  `json:"unit,omitempty"`
-						IsBonus    bool    `json:"is_bonus"`
-					}{ID: p.ID, Title: p.Title, IsBonus: p.IsBonus, Unit: p.UnitSize}
-					if p.IsBonus {
-						it.BonusPrice = p.Price.Now
-						it.Price = p.Price.Was
-						if it.Price == 0 {
-							it.Price = p.Price.Now
-						}
-					} else {
-						it.Price = p.Price.Now
-					}
-					items = append(items, it)
+					items = append(items, newProductItem(p, includeImages))
 				}
 				results[i].Results = items
 
-				// Store in cache so single-search calls also benefit.
+				// Store in cache so single-search calls also benefit. An empty
+				// result may be transient, so it is never cached.
+				if len(items) == 0 {
+					return
+				}
 				if data, err := json.Marshal(items); err == nil {
 					GlobalCache.Set(cacheKey, data, CacheTTLSearch)
 				}
@@ -572,19 +607,22 @@ func registerGetProductsBulk(s *server.MCPServer, deps Deps) {
 			"Get details for multiple products by ID in one tool call. "+
 				"Use instead of calling ah_get_product repeatedly — saves tool-call quota. "+
 				"Optionally include nutritional info (calories, fat, protein, etc.) for all products. "+
+				"Returns the same availability flags and property_icons as ah_get_product, plus description "+
+				"and zelf_toevoegen (a meal kit's 'Zelf toevoegen' text: the extras to buy). "+
 				"Max 20 product IDs per call.",
 		),
-		mcp.WithString("product_ids",
+		mcp.WithArray("product_ids",
 			mcp.Required(),
-			mcp.Description("JSON array of product IDs, e.g. [123456, 789012, 345678]"),
+			mcp.Description("Product IDs, e.g. [123456, 789012, 345678]"),
+			mcp.Items(productIDsSchema),
 		),
-		mcp.WithString("include_nutritional_info",
-			mcp.Description("Set to 'true' to include nutritional values for all products (default false)"),
+		mcp.WithBoolean("include_nutritional_info",
+			mcp.Description("Set to true to include nutritional values for all products (default false)"),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -594,21 +632,9 @@ func registerGetProductsBulk(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Client error: %v", err)), nil
 		}
 
-		var productIDs []int
-		rawIDs := req.GetArguments()["product_ids"]
-		switch v := rawIDs.(type) {
-		case string:
-			if err := json.Unmarshal([]byte(v), &productIDs); err != nil {
-				return errResult(fmt.Sprintf("product_ids must be a JSON array: %v", err)), nil
-			}
-		case []any:
-			for _, r := range v {
-				if pid := toInt(r); pid > 0 {
-					productIDs = append(productIDs, pid)
-				}
-			}
-		default:
-			return errResult("product_ids is required"), nil
+		productIDs, err := parseIntArray("product_ids", req.GetArguments()["product_ids"])
+		if err != nil {
+			return errResult(err.Error()), nil
 		}
 		if len(productIDs) == 0 {
 			return errResult("product_ids array is empty"), nil
@@ -617,55 +643,65 @@ func registerGetProductsBulk(s *server.MCPServer, deps Deps) {
 			productIDs = productIDs[:20]
 		}
 
-		includeNutri := req.GetString("include_nutritional_info", "") == "true"
+		includeNutri := req.GetBool("include_nutritional_info", false)
 		start := time.Now()
 
-		type productResult struct {
-			ID                   int         `json:"id"`
-			Title                string      `json:"title"`
-			Brand                string      `json:"brand,omitempty"`
-			Category             string      `json:"category,omitempty"`
-			Price                float64     `json:"price"`
-			BonusPrice           float64     `json:"bonus_price,omitempty"`
-			UnitSize             string      `json:"unit_size,omitempty"`
-			IsBonus              bool        `json:"is_bonus"`
-			NutriScore           string      `json:"nutri_score,omitempty"`
-			IsAvailable          bool        `json:"is_available"`
-			NutritionalInfo      interface{} `json:"nutritional_info,omitempty"`
-			Error                string      `json:"error,omitempty"`
+		cacheKey := func(pid int) string {
+			if includeNutri {
+				return BulkProductFullCacheKey(pid)
+			}
+			return BulkProductCacheKey(pid)
 		}
 
-		results := make([]productResult, len(productIDs))
+		// misses holds the indexes of results that are not served from cache.
+		results := make([]bulkProduct, len(productIDs))
+		var misses []int
 		for i, pid := range productIDs {
 			results[i].ID = pid
+			if cached, ok := GlobalCache.Get(cacheKey(pid)); ok {
+				var pr bulkProduct
+				if json.Unmarshal(cached, &pr) == nil {
+					results[i] = pr
+					continue
+				}
+			}
+			misses = append(misses, i)
+		}
+
+		// Nutrition needs a GraphQL call per product, so only the plain path
+		// batches. Ids the batch leaves out stay in misses for the per-id fetch.
+		if !includeNutri && len(misses) > 0 {
+			ids := make([]int, len(misses))
+			for j, i := range misses {
+				ids[j] = productIDs[i]
+			}
+			found := getProductsBatched(ctx, c, ids)
+			remaining := misses[:0]
+			for _, i := range misses {
+				p, ok := found[productIDs[i]]
+				if !ok {
+					remaining = append(remaining, i)
+					continue
+				}
+				results[i] = newBulkProduct(&p, false)
+				if data, err := json.Marshal(results[i]); err == nil {
+					GlobalCache.Set(cacheKey(p.ID), data, CacheTTLProduct)
+				}
+			}
+			misses = remaining
 		}
 
 		const concurrency = 5
 		sem := make(chan struct{}, concurrency)
 		var wg sync.WaitGroup
 
-		for i, pid := range productIDs {
+		for _, i := range misses {
 			wg.Add(1)
-			i, pid := i, pid
+			pid := productIDs[i]
 			go func() {
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-
-				var cacheKey string
-				if includeNutri {
-					cacheKey = ProductFullCacheKey(pid)
-				} else {
-					cacheKey = ProductCacheKey(pid)
-				}
-
-				if cached, ok := GlobalCache.Get(cacheKey); ok {
-					var pr productResult
-					if json.Unmarshal(cached, &pr) == nil {
-						results[i] = pr
-						return
-					}
-				}
 
 				var p *appie.Product
 				if err := withRetry(ctx, "ah_get_products_bulk", func() error {
@@ -681,32 +717,11 @@ func registerGetProductsBulk(s *server.MCPServer, deps Deps) {
 					return
 				}
 
-				pr := productResult{
-					ID:          p.ID,
-					Title:       p.Title,
-					Brand:       p.Brand,
-					Category:    p.Category,
-					IsBonus:     p.IsBonus,
-					NutriScore:  p.NutriScore,
-					IsAvailable: p.IsAvailable,
-					UnitSize:    p.UnitSize,
-				}
-				if p.IsBonus {
-					pr.BonusPrice = p.Price.Now
-					pr.Price = p.Price.Was
-					if pr.Price == 0 {
-						pr.Price = p.Price.Now
-					}
-				} else {
-					pr.Price = p.Price.Now
-				}
-				if includeNutri && len(p.NutritionalInfo) > 0 {
-					pr.NutritionalInfo = p.NutritionalInfo
-				}
+				pr := newBulkProduct(p, includeNutri)
 				results[i] = pr
 
 				if data, err := json.Marshal(pr); err == nil {
-					GlobalCache.Set(cacheKey, data, CacheTTLProduct)
+					GlobalCache.Set(cacheKey(pid), data, CacheTTLProduct)
 				}
 			}()
 		}
@@ -715,6 +730,32 @@ func registerGetProductsBulk(s *server.MCPServer, deps Deps) {
 		LogInfo("ah_get_products_bulk", "ids=%d nutri=%v duration=%v", len(productIDs), includeNutri, time.Since(start))
 		return jsonResult(results)
 	})
+}
+
+// productBatchSize caps the ids per GetProductsByIDs call to keep the URL short.
+const productBatchSize = 30
+
+// getProductsBatched fetches ids in chunks with GetProductsByIDs and returns the
+// products by id. The endpoint silently leaves out unknown ids (such as BE
+// web-only products), and a failed chunk is skipped, so callers must fall back
+// to per-id fetches for any id not in the map.
+func getProductsBatched(ctx context.Context, c *appie.Client, ids []int) map[int]appie.Product {
+	found := make(map[int]appie.Product, len(ids))
+	for chunk := range slices.Chunk(ids, productBatchSize) {
+		var products []appie.Product
+		if err := withRetry(ctx, "ah_get_products_bulk", func() error {
+			var e error
+			products, e = c.GetProductsByIDs(ctx, chunk)
+			return e
+		}); err != nil {
+			LogWarn("ah_get_products_bulk", "batch of %d ids failed, falling back per id: %v", len(chunk), err)
+			continue
+		}
+		for _, p := range products {
+			found[p.ID] = p
+		}
+	}
+	return found
 }
 
 // --- ah_search_stores ---
@@ -733,7 +774,7 @@ func registerSearchStores(s *server.MCPServer, deps Deps) {
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -766,28 +807,27 @@ func registerSearchStores(s *server.MCPServer, deps Deps) {
 		}
 
 		type storeEntry struct {
-			ID        int    `json:"id"`
-			Name      string `json:"name"`
-			Type      string `json:"type,omitempty"`
-			Street    string `json:"street,omitempty"`
-			City      string `json:"city,omitempty"`
+			ID         int    `json:"id"`
+			Name       string `json:"name"`
+			Type       string `json:"type,omitempty"`
+			Street     string `json:"street,omitempty"`
+			City       string `json:"city,omitempty"`
 			PostalCode string `json:"postal_code,omitempty"`
 		}
 		results := make([]storeEntry, 0, len(stores))
 		for _, st := range stores {
 			results = append(results, storeEntry{
-				ID:        st.ID,
-				Name:      st.Name,
-				Type:      st.StoreType,
-				Street:    fmt.Sprintf("%s %s", st.Address.Street, st.Address.HouseNumber),
-				City:      st.Address.City,
+				ID:         st.ID,
+				Name:       st.Name,
+				Type:       st.StoreType,
+				Street:     fmt.Sprintf("%s %s", st.Address.Street, st.Address.HouseNumber),
+				City:       st.Address.City,
 				PostalCode: st.Address.PostalCode,
 			})
 		}
 		return jsonResult(results)
 	})
 }
-
 
 // --- ah_get_product ---
 
@@ -796,21 +836,21 @@ func registerGetProduct(s *server.MCPServer, deps Deps) {
 		mcp.WithTitleAnnotation("Albert Heijn: Product Details"),
 		mcp.WithDescription(
 			"Get detailed information about a single Albert Heijn product by ID. "+
-				"Returns title, brand, category, description, price, unit size, bonus info, NutriScore, property icons. "+
+				"Returns title, brand, category, description, price, unit size, bonus info, NutriScore, property icons, is_available, is_orderable, previously_bought. "+
 				"Set include_nutritional_info=true to also return calories, fat, protein, etc. "+
 				"Get product_id from ah_search_products.",
 		),
-		mcp.WithString("product_id",
+		mcp.WithNumber("product_id",
 			mcp.Required(),
 			mcp.Description("Numeric product ID from ah_search_products"),
 		),
-		mcp.WithString("include_nutritional_info",
-			mcp.Description("Set to 'true' to include nutritional values (default false)"),
+		mcp.WithBoolean("include_nutritional_info",
+			mcp.Description("Set to true to include nutritional values (default false)"),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -820,11 +860,14 @@ func registerGetProduct(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Client error: %v", err)), nil
 		}
 
-		productID := req.GetInt("product_id", 0)
+		productID, err := argInt(req, "product_id", 0)
+		if err != nil {
+			return errResult(err.Error()), nil
+		}
 		if productID == 0 {
 			return errResult("product_id is required"), nil
 		}
-		includeNutri := req.GetString("include_nutritional_info", "") == "true"
+		includeNutri := req.GetBool("include_nutritional_info", false)
 		start := time.Now()
 
 		var cacheKey string
@@ -866,7 +909,10 @@ func registerGetProduct(s *server.MCPServer, deps Deps) {
 			BonusMechanism       string      `json:"bonus_mechanism,omitempty"`
 			NutriScore           string      `json:"nutri_score,omitempty"`
 			IsAvailable          bool        `json:"is_available"`
+			IsOrderable          bool        `json:"is_orderable"`
+			PreviouslyBought     bool        `json:"previously_bought,omitempty"`
 			PropertyIcons        []string    `json:"property_icons,omitempty"`
+			ZelfToevoegen        string      `json:"zelf_toevoegen,omitempty"`
 			NutritionalInfo      interface{} `json:"nutritional_info,omitempty"`
 			ImageURL             string      `json:"image_url,omitempty"`
 		}
@@ -880,26 +926,21 @@ func registerGetProduct(s *server.MCPServer, deps Deps) {
 			BonusMechanism:       p.BonusMechanism,
 			NutriScore:           p.NutriScore,
 			IsAvailable:          p.IsAvailable,
+			IsOrderable:          p.IsOrderable,
+			PreviouslyBought:     p.IsPreviouslyBought,
 			UnitSize:             p.UnitSize,
 			UnitPriceDescription: p.UnitPriceDescription,
 			PropertyIcons:        p.PropertyIcons,
+			ZelfToevoegen:        p.SelfAdd,
 		}
-		if p.IsBonus {
-			r.BonusPrice = p.Price.Now
-			r.Price = p.Price.Was
-			if r.Price == 0 {
-				r.Price = p.Price.Now
-			}
-		} else {
-			r.Price = p.Price.Now
-		}
+		r.Price, r.BonusPrice = splitPrice(*p)
 		if len(p.Images) > 0 {
 			r.ImageURL = p.Images[0].URL
 		}
 		if includeNutri && len(p.NutritionalInfo) > 0 {
 			r.NutritionalInfo = p.NutritionalInfo
 		}
-		data, err := json.MarshalIndent(r, "", "  ")
+		data, err := json.Marshal(r)
 		if err != nil {
 			return errResult(fmt.Sprintf("marshal result: %v", err)), nil
 		}
@@ -923,16 +964,19 @@ func registerSearchProductsFiltered(s *server.MCPServer, deps Deps) {
 			mcp.Required(),
 			mcp.Description("Search query in Dutch or English"),
 		),
-		mcp.WithString("limit",
+		mcp.WithNumber("limit",
 			mcp.Description("Maximum number of results (default 10, max 30)"),
 		),
-		mcp.WithString("bonus",
-			mcp.Description("Set to 'true' to return only products currently on bonus/promotion"),
+		mcp.WithBoolean("bonus",
+			mcp.Description("Set to true to return only products currently on bonus/promotion"),
+		),
+		mcp.WithBoolean("include_images",
+			mcp.Description("Set to true to include image_url in each result (default false)"),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -946,8 +990,12 @@ func registerSearchProductsFiltered(s *server.MCPServer, deps Deps) {
 		if query == "" {
 			return errResult("query is required"), nil
 		}
-		limit := req.GetInt("limit", 10)
-		bonus := req.GetString("bonus", "") == "true"
+		limit, err := argInt(req, "limit", 10)
+		if err != nil {
+			return errResult(err.Error()), nil
+		}
+		bonus := req.GetBool("bonus", false)
+		includeImages := req.GetBool("include_images", false)
 
 		products, err := c.SearchProductsFiltered(ctx, appie.SearchOptions{
 			Query: query,
@@ -958,31 +1006,9 @@ func registerSearchProductsFiltered(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Search failed: %v", err)), nil
 		}
 
-		type item struct {
-			ID         int     `json:"id"`
-			Title      string  `json:"title"`
-			Price      float64 `json:"price"`
-			BonusPrice float64 `json:"bonus_price,omitempty"`
-			Unit       string  `json:"unit,omitempty"`
-			IsBonus    bool    `json:"is_bonus"`
-			ImageURL   string  `json:"image_url,omitempty"`
-		}
-		results := make([]item, 0, len(products))
+		results := make([]productItem, 0, len(products))
 		for _, p := range products {
-			it := item{ID: p.ID, Title: p.Title, IsBonus: p.IsBonus, Unit: p.UnitSize}
-			if p.IsBonus {
-				it.BonusPrice = p.Price.Now
-				it.Price = p.Price.Was
-				if it.Price == 0 {
-					it.Price = p.Price.Now
-				}
-			} else {
-				it.Price = p.Price.Now
-			}
-			if len(p.Images) > 0 {
-				it.ImageURL = p.Images[0].URL
-			}
-			results = append(results, it)
+			results = append(results, newProductItem(p, includeImages))
 		}
 		return jsonResult(results)
 	})

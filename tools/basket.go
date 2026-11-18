@@ -2,7 +2,6 @@ package tools
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -34,7 +33,7 @@ func registerGetShoppingList(s *server.MCPServer, deps Deps) {
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -58,6 +57,7 @@ func registerGetShoppingList(s *server.MCPServer, deps Deps) {
 		type v2Item struct {
 			ListItemID     int              `json:"listItemId"`
 			Quantity       int              `json:"quantity"`
+			Description    string           `json:"description"` // free-text lines have no product
 			StrikedThrough bool             `json:"strikedthrough"`
 			Position       int              `json:"position"`
 			ProductDetails v2ProductDetails `json:"productDetails"`
@@ -75,8 +75,8 @@ func registerGetShoppingList(s *server.MCPServer, deps Deps) {
 		}
 
 		type entry struct {
-			Position  int `json:"position"`
-			ItemID    int `json:"item_id,omitempty"`
+			Position  int    `json:"position"`
+			ItemID    int    `json:"item_id,omitempty"`
 			Name      string `json:"name"`
 			ProductID int    `json:"product_id,omitempty"`
 			Quantity  int    `json:"quantity"`
@@ -85,6 +85,9 @@ func registerGetShoppingList(s *server.MCPServer, deps Deps) {
 		entries := make([]entry, 0, len(raw.Items))
 		for _, item := range raw.Items {
 			name := item.ProductDetails.Product.Title
+			if name == "" {
+				name = item.Description
+			}
 			pid := item.ProductDetails.Product.WebshopID
 			entries = append(entries, entry{
 				Position:  item.Position,
@@ -109,14 +112,15 @@ func registerAddToShoppingList(s *server.MCPServer, deps Deps) {
 				"Pass an array of items, each with product_id (int) and quantity (int). "+
 				"Returns confirmation listing the names of successfully added products.",
 		),
-		mcp.WithString("items",
+		mcp.WithArray("items",
 			mcp.Required(),
-			mcp.Description(`JSON array of items to add. Each item needs product_id (int) and quantity (int). Example: [{"product_id": 123456, "quantity": 2}]`),
+			mcp.Description(`Items to add. Each item needs product_id (int) and quantity (int > 0, default 1). Example: [{"product_id": 123456, "quantity": 2}]`),
+			mcp.Items(itemSchema("product_id")),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -126,40 +130,17 @@ func registerAddToShoppingList(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Client error: %v", err)), nil
 		}
 
-		type inputItem struct {
-			ProductID int `json:"product_id"`
-			Quantity  int `json:"quantity"`
+		inputItems, err := parseItems("items", req.GetArguments()["items"], 1)
+		if err != nil {
+			return errResult(err.Error()), nil
 		}
-		var inputItems []inputItem
-
-		// items arrives either as a native []any (some clients) or as a
-		// JSON-encoded string "[{...}]" (Claude Desktop / Claude Code).
-		rawItems := req.GetArguments()["items"]
-		switch v := rawItems.(type) {
-		case string:
-			if err := json.Unmarshal([]byte(v), &inputItems); err != nil {
-				return errResult(fmt.Sprintf("items must be a JSON array: %v", err)), nil
-			}
-		case []any:
-			for _, raw := range v {
-				m, mOK := raw.(map[string]any)
-				if !mOK {
-					continue
-				}
-				pid := toInt(m["product_id"])
-				qty := toInt(m["quantity"])
-				if pid > 0 && qty > 0 {
-					inputItems = append(inputItems, inputItem{ProductID: pid, Quantity: qty})
-				}
-			}
-		case nil:
-			return errResult("items parameter is required"), nil
-		default:
-			return errResult("items must be a JSON array"), nil
-		}
-
 		if len(inputItems) == 0 {
-			return errResult("no valid items provided (each item needs product_id > 0 and quantity > 0)"), nil
+			return errResult("items array is empty"), nil
+		}
+		for i, it := range inputItems {
+			if it.Quantity == 0 {
+				return errResult(fmt.Sprintf("items[%d].quantity must be > 0", i)), nil
+			}
 		}
 
 		listItems := make([]appie.ListItem, 0, len(inputItems))
@@ -199,20 +180,6 @@ func registerAddToShoppingList(s *server.MCPServer, deps Deps) {
 	})
 }
 
-// toInt converts interface{} to int, supporting float64 (JSON numbers) and int.
-func toInt(v any) int {
-	switch val := v.(type) {
-	case float64:
-		return int(val)
-	case int:
-		return val
-	case int64:
-		return int(val)
-	default:
-		return 0
-	}
-}
-
 // --- ah_add_free_text_to_shopping_list ---
 
 func registerAddFreeTextToShoppingList(s *server.MCPServer, deps Deps) {
@@ -220,19 +187,20 @@ func registerAddFreeTextToShoppingList(s *server.MCPServer, deps Deps) {
 		mcp.WithTitleAnnotation("Albert Heijn: Add Free-Text to Shopping List"),
 		mcp.WithDescription(
 			"Add a free-text item to the Albert Heijn shopping list (no product ID needed). "+
-				"Use for reminders like 'verse bloemen', 'any good wine', or items not found in search.",
+				"Use for reminders like 'verse bloemen', 'any good wine', or items not found in search. "+
+				"The list is read back after the add; the result says whether the item was verified.",
 		),
 		mcp.WithString("name",
 			mcp.Required(),
 			mcp.Description("Free-text item description, e.g. 'verse bloemen', 'goede rode wijn'"),
 		),
-		mcp.WithString("quantity",
+		mcp.WithNumber("quantity",
 			mcp.Description("Quantity (default 1)"),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -246,15 +214,22 @@ func registerAddFreeTextToShoppingList(s *server.MCPServer, deps Deps) {
 		if name == "" {
 			return errResult("name is required"), nil
 		}
-		quantity := req.GetInt("quantity", 1)
+		quantity, err := argInt(req, "quantity", 1)
+		if err != nil {
+			return errResult(err.Error()), nil
+		}
 		if quantity < 1 {
 			quantity = 1
 		}
 
-		if err := c.AddFreeTextToShoppingList(ctx, name, quantity); err != nil {
-			return errResult(fmt.Sprintf("Failed to add free-text item: %v", err)), nil
+		verified, err := c.AddFreeTextToShoppingList(ctx, name, quantity)
+		if err != nil {
+			return errResult(fmt.Sprintf("Failed to add free-text item '%s': %v", name, err)), nil
 		}
-		return mcp.NewToolResultText(fmt.Sprintf("Added '%s' (x%d) to shopping list.", name, quantity)), nil
+		if !verified {
+			return mcp.NewToolResultText(fmt.Sprintf("NOT VERIFIED: AH accepted '%s' but the list read-back shows no free-text line with that name at that quantity; treat it as not added.", name)), nil
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("Added '%s' (x%d) to shopping list (verified on read-back).", name, quantity)), nil
 	})
 }
 
@@ -268,16 +243,18 @@ func registerRemoveFromShoppingList(s *server.MCPServer, deps Deps) {
 				"For product items pass product_ids; for free-text items pass names. "+
 				"Get product_ids from ah_get_shopping_list.",
 		),
-		mcp.WithString("product_ids",
-			mcp.Description("JSON array of product IDs to remove, e.g. [123456, 789012]. Use for product items."),
+		mcp.WithArray("product_ids",
+			mcp.Description("Product IDs to remove, e.g. [123456, 789012]. Use for product items."),
+			mcp.Items(productIDsSchema),
 		),
-		mcp.WithString("names",
-			mcp.Description(`JSON array of free-text item names to remove, e.g. ["verse bloemen"]. Use for items without a product ID.`),
+		mcp.WithArray("names",
+			mcp.Description(`Free-text item names to remove, e.g. ["verse bloemen"]. Use for items without a product ID.`),
+			mcp.WithStringItems(),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -287,37 +264,16 @@ func registerRemoveFromShoppingList(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Client error: %v", err)), nil
 		}
 
-		// Parse product_ids
 		var productIDs []int
 		if raw := req.GetArguments()["product_ids"]; raw != nil {
-			switch v := raw.(type) {
-			case string:
-				if err := json.Unmarshal([]byte(v), &productIDs); err != nil {
-					return errResult(fmt.Sprintf("product_ids must be a JSON array of integers: %v", err)), nil
-				}
-			case []any:
-				for _, r := range v {
-					if pid := toInt(r); pid > 0 {
-						productIDs = append(productIDs, pid)
-					}
-				}
+			if productIDs, err = parseIntArray("product_ids", raw); err != nil {
+				return errResult(err.Error()), nil
 			}
 		}
-
-		// Parse names (for free-text items)
 		var names []string
 		if raw := req.GetArguments()["names"]; raw != nil {
-			switch v := raw.(type) {
-			case string:
-				if err := json.Unmarshal([]byte(v), &names); err != nil {
-					return errResult(fmt.Sprintf("names must be a JSON array of strings: %v", err)), nil
-				}
-			case []any:
-				for _, r := range v {
-					if s, ok := r.(string); ok && s != "" {
-						names = append(names, s)
-					}
-				}
+			if names, err = parseStringArray("names", raw); err != nil {
+				return errResult(err.Error()), nil
 			}
 		}
 
@@ -325,95 +281,12 @@ func registerRemoveFromShoppingList(s *server.MCPServer, deps Deps) {
 			return errResult("provide at least one product_id or name to remove"), nil
 		}
 
-		// First fetch the current list so we can identify item positions.
-		type v2RawItem struct {
-			ListItemID int    `json:"listItemId"`
-			Position   int    `json:"position"`
-			OriginCode string `json:"originCode"`
-			Quantity   int    `json:"quantity"`
-			Type       string `json:"type"`
-			Description string `json:"description"`
-			ProductDetails struct {
-				Product struct {
-					WebshopID int    `json:"webshopId"`
-					Title     string `json:"title"`
-				} `json:"product"`
-			} `json:"productDetails"`
-		}
-		type v2ListResp struct {
-			Items []v2RawItem `json:"items"`
-		}
-		var currentList v2ListResp
-		if err := c.DoRequest(ctx, "GET", "/mobile-services/shoppinglist/v2/items", nil, &currentList); err != nil {
-			return errResult(fmt.Sprintf("Failed to read shopping list: %v", err)), nil
-		}
-
-		// Build set of things to remove.
-		removeByProductID := map[int]bool{}
-		for _, pid := range productIDs {
-			removeByProductID[pid] = true
-		}
-		removeByName := map[string]bool{}
-		for _, n := range names {
-			removeByName[strings.ToLower(n)] = true
-		}
-
-		// Filter — keep items NOT in the remove sets.
-		type keepItem struct {
-			ProductID   int    `json:"productId,omitempty"`
-			Description string `json:"description,omitempty"`
-			Quantity    int    `json:"quantity"`
-			Type        string `json:"type"`
-			OriginCode  string `json:"originCode"`
-		}
-		var keepItems []keepItem
-		for _, it := range currentList.Items {
-			pid := it.ProductDetails.Product.WebshopID
-			desc := strings.ToLower(it.Description)
-			if removeByProductID[pid] || removeByName[desc] {
-				continue // drop this item
-			}
-			keepItems = append(keepItems, keepItem{
-				ProductID:   pid,
-				Description: it.Description,
-				Quantity:    it.Quantity,
-				Type:        it.Type,
-				OriginCode:  it.OriginCode,
-			})
-		}
-
-		// Build the removal PATCH payload — quantity 0 signals deletion on the v2 API.
-		type removeItem struct {
-			ProductID   int    `json:"productId,omitempty"`
-			Description string `json:"description,omitempty"`
-			Quantity    int    `json:"quantity"`
-			Type        string `json:"type"`
-			OriginCode  string `json:"originCode"`
-		}
-		var removeItems []removeItem
-		for _, it := range currentList.Items {
-			pid := it.ProductDetails.Product.WebshopID
-			desc := strings.ToLower(it.Description)
-			if removeByProductID[pid] || removeByName[desc] {
-				oc := it.OriginCode
-				if oc == "" {
-					oc = "PRD"
-				}
-				removeItems = append(removeItems, removeItem{
-					ProductID:   pid,
-					Description: it.Description,
-					Quantity:    0,
-					Type:        it.Type,
-					OriginCode:  oc,
-				})
-			}
-		}
-		if len(removeItems) == 0 {
-			return errResult("no matching items found on the shopping list"), nil
-		}
-		patchBody := map[string]any{"items": removeItems}
-		if err := c.DoRequest(ctx, "PATCH", "/mobile-services/shoppinglist/v2/items", patchBody, nil); err != nil {
-			return errResult(fmt.Sprintf("Failed to update shopping list: %v", err)), nil
+		// The v2 delete is a PATCH with quantity 0, but the payload must carry the
+		// same fields a normal add sends (description/searchTerm/strikeThrough) or
+		// the API returns 400 "Failed to read request". RemoveFromShoppingList
+		// fetches the list, matches by product id or title, and builds that shape.
+		if err := c.RemoveFromShoppingList(ctx, productIDs, names); err != nil {
+			return errResult(fmt.Sprintf("Failed to remove from shopping list: %v", err)), nil
 		}
 
 		var removed []string
@@ -440,13 +313,13 @@ func registerCheckShoppingListItem(s *server.MCPServer, deps Deps) {
 			mcp.Required(),
 			mcp.Description("Item ID (string) from a favorite list — NOT from ah_get_shopping_list (those have no usable IDs)"),
 		),
-		mcp.WithString("checked",
-			mcp.Description("'true' to check the item (default), 'false' to uncheck"),
+		mcp.WithBoolean("checked",
+			mcp.Description("true to check the item (default), false to uncheck"),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -460,7 +333,7 @@ func registerCheckShoppingListItem(s *server.MCPServer, deps Deps) {
 		if itemID == "" {
 			return errResult("item_id is required"), nil
 		}
-		checked := req.GetString("checked", "true") != "false"
+		checked := req.GetBool("checked", true)
 
 		if err := c.CheckShoppingListItem(ctx, itemID, checked); err != nil {
 			return errResult(fmt.Sprintf("Failed to update item %s: %v", itemID, err)), nil
@@ -489,7 +362,7 @@ func registerClearShoppingList(s *server.MCPServer, deps Deps) {
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if req.GetString("confirm", "") != "yes" {
 			return errResult("confirm must be \"yes\" to clear the shopping list"), nil
@@ -502,50 +375,17 @@ func registerClearShoppingList(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Client error: %v", err)), nil
 		}
 
-		// Read all v2 items, then PATCH each with quantity=0 to remove them.
-		type v2ClearItem struct {
-			ListItemID int    `json:"listItemId"`
-			OriginCode string `json:"originCode"`
-			Quantity   int    `json:"quantity"`
-			Type       string `json:"type"`
-			Description string `json:"description"`
-			ProductDetails struct {
-				Product struct {
-					WebshopID int `json:"webshopId"`
-				} `json:"product"`
-			} `json:"productDetails"`
-		}
-		type v2ClearResp struct {
-			Items []v2ClearItem `json:"items"`
-		}
-		var current v2ClearResp
-		if err := c.DoRequest(ctx, "GET", "/mobile-services/shoppinglist/v2/items", nil, &current); err != nil {
-			return errResult(fmt.Sprintf("Failed to read shopping list: %v", err)), nil
-		}
-		if len(current.Items) == 0 {
-			return mcp.NewToolResultText("Shopping list is already empty."), nil
-		}
-		type zeroItem struct {
-			ProductID   int    `json:"productId,omitempty"`
-			Description string `json:"description,omitempty"`
-			Quantity    int    `json:"quantity"`
-			Type        string `json:"type"`
-			OriginCode  string `json:"originCode"`
-		}
-		zeros := make([]zeroItem, 0, len(current.Items))
-		for _, it := range current.Items {
-			zeros = append(zeros, zeroItem{
-				ProductID:   it.ProductDetails.Product.WebshopID,
-				Description: it.Description,
-				Quantity:    0,
-				Type:        it.Type,
-				OriginCode:  it.OriginCode,
-			})
-		}
-		if err := c.DoRequest(ctx, "PATCH", "/mobile-services/shoppinglist/v2/items", map[string]any{"items": zeros}, nil); err != nil {
+		n, left, err := c.ClearBoodschappenlijst(ctx)
+		if err != nil {
 			return errResult(fmt.Sprintf("Failed to clear shopping list: %v", err)), nil
 		}
-		return mcp.NewToolResultText("Shopping list cleared."), nil
+		if n == 0 && left == 0 {
+			return mcp.NewToolResultText("Shopping list is already empty."), nil
+		}
+		if left > 0 {
+			return mcp.NewToolResultText(fmt.Sprintf("Shopping list NOT fully cleared: %d item(s) removed, %d still on the list after read-back.", n, left)), nil
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("Shopping list cleared (%d item(s) removed).", n)), nil
 	})
 }
 
@@ -556,13 +396,14 @@ func registerShoppingListToOrder(s *server.MCPServer, deps Deps) {
 		mcp.WithTitleAnnotation("Albert Heijn: Move List to Cart"),
 		mcp.WithDescription(
 			"Add all unchecked product items from the Albert Heijn shopping list to the online order (cart). "+
-				"Free-text items and already-checked items are skipped. "+
-				"Use ah_get_cart to review the result.",
+				"List quantities are added on top of what the cart already holds. "+
+				"Free-text items and struck-through items are skipped. "+
+				"Returns landed, rejected (silently dropped by the delivery slot) and qty_mismatch lines from an order read-back.",
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -572,10 +413,21 @@ func registerShoppingListToOrder(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Client error: %v", err)), nil
 		}
 
-		if err := c.ShoppingListToOrder(ctx); err != nil {
+		res, err := c.ShoppingListToOrder(ctx)
+		// A failed read-back after the write is not a missing order: the items
+		// may already be in it, so the reopen hint would mislead.
+		if isNoActiveOrder(err) && !strings.Contains(err.Error(), "items were sent") {
+			return errResult(noActiveOrderHint), nil
+		}
+		if err != nil {
 			return errResult(fmt.Sprintf("Failed to move shopping list to order: %v", err)), nil
 		}
-		return mcp.NewToolResultText("Shopping list items added to your online order. Use ah_get_cart to review."), nil
+		if res == nil {
+			return mcp.NewToolResultText("No unchecked product items on the shopping list; nothing sent to the order."), nil
+		}
+		// landed/rejected/qty_mismatch come from reading the order back: AH
+		// accepts the mutation even when the delivery slot drops an item.
+		return jsonResult(res)
 	})
 }
 
@@ -591,7 +443,7 @@ func registerGetFavoriteLists(s *server.MCPServer, deps Deps) {
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -632,14 +484,15 @@ func registerAddToFavoriteList(s *server.MCPServer, deps Deps) {
 			mcp.Required(),
 			mcp.Description("Favorite list ID from ah_get_favorite_lists"),
 		),
-		mcp.WithString("items",
+		mcp.WithArray("items",
 			mcp.Required(),
-			mcp.Description("JSON array of items: [{\"product_id\": 123456, \"quantity\": 1}]"),
+			mcp.Description(`Items to add, quantity defaults to 1: [{"product_id": 123456, "quantity": 1}]`),
+			mcp.Items(itemSchema("product_id")),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -654,42 +507,18 @@ func registerAddToFavoriteList(s *server.MCPServer, deps Deps) {
 			return errResult("list_id is required"), nil
 		}
 
-		type inputItem struct {
-			ProductID int `json:"product_id"`
-			Quantity  int `json:"quantity"`
-		}
-		var inputItems []inputItem
-		rawItems := req.GetArguments()["items"]
-		switch v := rawItems.(type) {
-		case string:
-			if err := json.Unmarshal([]byte(v), &inputItems); err != nil {
-				return errResult(fmt.Sprintf("items must be a JSON array: %v", err)), nil
-			}
-		case []any:
-			for _, raw := range v {
-				m, ok := raw.(map[string]any)
-				if !ok {
-					continue
-				}
-				pid := toInt(m["product_id"])
-				qty := toInt(m["quantity"])
-				if qty == 0 {
-					qty = 1
-				}
-				if pid > 0 {
-					inputItems = append(inputItems, inputItem{ProductID: pid, Quantity: qty})
-				}
-			}
-		default:
-			return errResult("items must be a JSON array"), nil
+		inputItems, err := parseItems("items", req.GetArguments()["items"], 1)
+		if err != nil {
+			return errResult(err.Error()), nil
 		}
 		if len(inputItems) == 0 {
-			return errResult("no valid items provided"), nil
+			return errResult("items array is empty"), nil
 		}
 
 		listItems := make([]appie.ListItem, 0, len(inputItems))
 		for _, it := range inputItems {
-			listItems = append(listItems, appie.ListItem{ProductID: it.ProductID, Quantity: it.Quantity})
+			qty := max(it.Quantity, 1)
+			listItems = append(listItems, appie.ListItem{ProductID: it.ProductID, Quantity: qty})
 		}
 		if err := c.AddToFavoriteList(ctx, listID, listItems); err != nil {
 			return errResult(fmt.Sprintf("Failed to add to favorite list: %v", err)), nil
@@ -711,14 +540,15 @@ func registerRemoveFromFavoriteList(s *server.MCPServer, deps Deps) {
 			mcp.Required(),
 			mcp.Description("Favorite list ID from ah_get_favorite_lists"),
 		),
-		mcp.WithString("product_ids",
+		mcp.WithArray("product_ids",
 			mcp.Required(),
-			mcp.Description("JSON array of product IDs to remove, e.g. [123456, 789012]"),
+			mcp.Description("Product IDs to remove, e.g. [123456, 789012]"),
+			mcp.Items(productIDsSchema),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -733,25 +563,12 @@ func registerRemoveFromFavoriteList(s *server.MCPServer, deps Deps) {
 			return errResult("list_id is required"), nil
 		}
 
-		var productIDs []int
-		rawIDs := req.GetArguments()["product_ids"]
-		switch v := rawIDs.(type) {
-		case string:
-			if err := json.Unmarshal([]byte(v), &productIDs); err != nil {
-				return errResult(fmt.Sprintf("product_ids must be a JSON array of integers: %v", err)), nil
-			}
-		case []any:
-			for _, raw := range v {
-				pid := toInt(raw)
-				if pid > 0 {
-					productIDs = append(productIDs, pid)
-				}
-			}
-		default:
-			return errResult("product_ids must be a JSON array of integers"), nil
+		productIDs, err := parseIntArray("product_ids", req.GetArguments()["product_ids"])
+		if err != nil {
+			return errResult(err.Error()), nil
 		}
 		if len(productIDs) == 0 {
-			return errResult("no valid product_ids provided"), nil
+			return errResult("product_ids array is empty"), nil
 		}
 
 		if err := c.RemoveFromFavoriteList(ctx, listID, productIDs); err != nil {

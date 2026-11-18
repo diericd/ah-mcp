@@ -19,13 +19,13 @@ import (
 )
 
 const (
-	ahAPIBase        = "https://api.ah.nl"
-	ahLoginBase      = "https://login.ah.nl"
-	ahClientID       = "appie-ios"
-	ahClientVersion  = "9.28"
-	ahUserAgent      = "Appie/9.28 (iPhone17,3; iPhone; CPU OS 26_1 like Mac OS X)"
-	oauthTimeout     = 5 * time.Minute
-	tokenRefreshBuf  = 60 * time.Second
+	ahAPIBase       = "https://api.ah.nl"
+	ahLoginBase     = "https://login.ah.be" // BE: was https://login.ah.nl
+	ahClientID      = "appie-be-ios"        // BE: was appie-ios
+	ahLoginPath     = "/login/nl-BE"        // BE: NL uses "/login"
+	ahClientVersion = "9.28"
+	ahUserAgent     = "Appie/9.28 (iPhone17,3; iPhone; CPU OS 26_1 like Mac OS X)"
+	oauthTimeout    = 5 * time.Minute
 
 	loginSuccessHTML = `<!DOCTYPE html>
 <html><head><title>Login Successful</title></head>
@@ -63,15 +63,56 @@ var oauthState struct {
 
 // TokensPath returns the path for storing OAuth tokens.
 // Override with AH_TOKENS_PATH env var; otherwise uses XDG-compliant location.
+// A relative AH_TOKENS_PATH resolves against the binary's directory, not the
+// cwd, because MCP clients start the server from whatever folder the session is in.
 func TokensPath() string {
 	if p := os.Getenv("AH_TOKENS_PATH"); p != "" {
-		return p
+		return resolveTokensPath(p, executableDir())
 	}
 	configDir, err := os.UserConfigDir()
 	if err != nil {
 		configDir = os.TempDir()
 	}
 	return filepath.Join(configDir, "ah-mcp", "tokens.json")
+}
+
+// resolveTokensPath joins a relative p onto exeDir. An empty exeDir leaves p as is.
+func resolveTokensPath(p, exeDir string) string {
+	if filepath.IsAbs(p) || exeDir == "" {
+		return p
+	}
+	return filepath.Join(exeDir, p)
+}
+
+// executableDir returns the directory of the running binary with symlinks
+// resolved, or "" if it cannot be determined.
+func executableDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	return filepath.Dir(exe)
+}
+
+// TokenStatus describes the token file at path in one line, so a missing file
+// can be told apart from an unusable or expired one.
+func TokenStatus(path string) string {
+	tf, err := LoadTokens(path)
+	switch {
+	case err != nil:
+		return fmt.Sprintf("unreadable token file at %s: %v", path, err)
+	case tf == nil:
+		return fmt.Sprintf("no token file at %s", path)
+	case tf.RefreshToken == "":
+		return fmt.Sprintf("no refresh token in %s", path)
+	case !tf.ExpiresAt.IsZero() && time.Now().After(tf.ExpiresAt):
+		return fmt.Sprintf("token file present at %s, access token expired at %s (refreshed on next call)", path, tf.ExpiresAt.Format(time.RFC3339))
+	default:
+		return fmt.Sprintf("token file present at %s", path)
+	}
 }
 
 // LoadTokens reads tokens from disk. Returns nil (no error) if file does not exist.
@@ -118,38 +159,6 @@ func IsAuthenticated(path string) bool {
 		return false
 	}
 	return tf.RefreshToken != ""
-}
-
-// RefreshIfNeeded refreshes the access token if it expires within tokenRefreshBuf.
-// Saves updated tokens on success.
-func RefreshIfNeeded(ctx context.Context, path string) error {
-	tf, err := LoadTokens(path)
-	if err != nil {
-		return fmt.Errorf("load tokens for refresh: %w", err)
-	}
-	if tf == nil || tf.RefreshToken == "" {
-		return fmt.Errorf("no refresh token available")
-	}
-
-	if !tf.ExpiresAt.IsZero() && time.Until(tf.ExpiresAt) > tokenRefreshBuf {
-		return nil // still valid
-	}
-
-	reqBody := map[string]string{
-		"clientId":     ahClientID,
-		"refreshToken": tf.RefreshToken,
-	}
-	var tok tokenResponse
-	if err := doAHPost(ctx, "/mobile-auth/v1/auth/token/refresh", reqBody, &tok); err != nil {
-		return fmt.Errorf("refresh token: %w", err)
-	}
-
-	tf.AccessToken = tok.AccessToken
-	tf.RefreshToken = tok.RefreshToken
-	if tok.ExpiresIn > 0 {
-		tf.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
-	}
-	return SaveTokens(path, tf)
 }
 
 // StartOAuthFlow starts a temporary reverse-proxy HTTP server on callbackPort,
@@ -219,8 +228,8 @@ func StartOAuthFlow(ctx context.Context, callbackHost string, callbackPort int, 
 
 	// Build the login URL that the user must open (via our local proxy).
 	loginURL = fmt.Sprintf(
-		"%s/login?client_id=%s&response_type=code&redirect_uri=appie://login-exit",
-		callbackHost, ahClientID,
+		"%s%s?client_id=%s&response_type=code&redirect_uri=appie://login-exit",
+		callbackHost, ahLoginPath, ahClientID,
 	)
 
 	// Wait for the code, exchange it, save tokens — all in background.

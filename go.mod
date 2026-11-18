@@ -7,6 +7,9 @@ require (
 	github.com/mark3labs/mcp-go v0.45.0
 )
 
+// BE fork: use the local appie-go with WithClientID/WithLoginBaseURL options.
+replace github.com/gwillem/appie-go => ../appie-go
+
 require (
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/buger/jsonparser v1.1.1 // indirect

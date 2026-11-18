@@ -6,7 +6,9 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
+	_ "time/tzdata" // Europe/Brussels must resolve on hosts without zoneinfo
 
 	appie "github.com/gwillem/appie-go"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -38,16 +40,18 @@ func registerGetOrderHistory(s *server.MCPServer, deps Deps) {
 		mcp.WithTitleAnnotation("Albert Heijn: Order History"),
 		mcp.WithDescription(
 			"Get upcoming Albert Heijn online delivery orders (open fulfillments). "+
-				"Returns id, date, total_price, status, modifiable flag. "+
+				"Returns id, date (ISO delivery date), date_display (Dutch text), total_price, "+
+				"status (Dutch text), status_code (raw AH code), cancelled, delivered, modifiable flag, "+
+				"closing_time (change deadline, RFC3339 Brussels time) and after_cutoff. "+
 				"Use the returned id with ah_reopen_order to edit a submitted order before its closing time.",
 		),
-		mcp.WithString("limit",
+		mcp.WithNumber("limit",
 			mcp.Description("Maximum number of orders to return (default 10)"),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -57,7 +61,10 @@ func registerGetOrderHistory(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Client error: %v", err)), nil
 		}
 
-		limit := req.GetInt("limit", 10)
+		limit, err := argInt(req, "limit", 10)
+		if err != nil {
+			return errResult(err.Error()), nil
+		}
 
 		fulfillments, err := c.GetFulfillments(ctx)
 		if err != nil {
@@ -65,32 +72,42 @@ func registerGetOrderHistory(s *server.MCPServer, deps Deps) {
 		}
 
 		type orderEntry struct {
-			ID          int     `json:"id"`
-			Date        string  `json:"date,omitempty"`
-			TimeWindow  string  `json:"time_window,omitempty"`
-			TotalPrice  float64 `json:"total_price"`
-			ItemCount   int     `json:"item_count,omitempty"`
-			Status      string  `json:"status"`
-			ShoppingType string `json:"shopping_type,omitempty"`
-			Modifiable  bool    `json:"modifiable"`
+			ID           int     `json:"id"`
+			Date         string  `json:"date,omitempty"`
+			DateDisplay  string  `json:"date_display,omitempty"`
+			TimeWindow   string  `json:"time_window,omitempty"`
+			TotalPrice   float64 `json:"total_price"`
+			ItemCount    int     `json:"item_count,omitempty"`
+			Status       string  `json:"status"`
+			StatusCode   int     `json:"status_code"`
+			Cancelled    bool    `json:"cancelled"`
+			Delivered    bool    `json:"delivered"`
+			ShoppingType string  `json:"shopping_type,omitempty"`
+			Modifiable   bool    `json:"modifiable"`
+			Reopenable   bool    `json:"reopenable"`
+			ClosingTime  string  `json:"closing_time,omitempty"`
+			AfterCutoff  bool    `json:"after_cutoff"`
 		}
 		results := make([]orderEntry, 0, len(fulfillments))
 		for i, f := range fulfillments {
 			if i >= limit {
 				break
 			}
-			date := f.Delivery.Slot.DateDisplay
-			if date == "" {
-				date = f.Delivery.Slot.Date
-			}
+			closing, _, _ := formatClosingTime(f.ClosingTime)
 			results = append(results, orderEntry{
-				ID:          f.OrderID,
-				Date:        date,
-				TimeWindow:  f.Delivery.Slot.TimeDisplay,
-				TotalPrice:  f.TotalPrice,
-				Status:      f.StatusDescription,
+				ID:           f.OrderID,
+				Date:         f.Delivery.Slot.Date,
+				DateDisplay:  f.Delivery.Slot.DateDisplay,
+				TimeWindow:   f.Delivery.Slot.TimeDisplay,
+				TotalPrice:   f.TotalPrice,
+				Status:       f.StatusDescription,
+				StatusCode:   f.StatusCode,
+				Cancelled:    isCancelledStatus(f.StatusDescription, f.Delivery.Status),
 				ShoppingType: f.ShoppingType,
-				Modifiable:  f.Modifiable,
+				Modifiable:   f.Modifiable,
+				Reopenable:   f.Reopenable,
+				ClosingTime:  closing,
+				AfterCutoff:  f.IsAfterCutOff,
 			})
 		}
 		return jsonResult(results)
@@ -104,16 +121,17 @@ func registerGetPastOrders(s *server.MCPServer, deps Deps) {
 		mcp.WithTitleAnnotation("Albert Heijn: Past Orders"),
 		mcp.WithDescription(
 			"Get past/delivered Albert Heijn online delivery orders. "+
-				"Returns id, date, total_price, status. "+
+				"Returns id, date (ISO delivery date), date_display (Dutch text), total_price, "+
+				"status (Dutch text), status_code (raw AH code), cancelled and delivered. "+
 				"Use the returned id with ah_get_order_details to see full item lists.",
 		),
-		mcp.WithString("limit",
+		mcp.WithNumber("limit",
 			mcp.Description("Maximum number of orders to return (default 10)"),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -123,9 +141,57 @@ func registerGetPastOrders(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Client error: %v", err)), nil
 		}
 
-		limit := req.GetInt("limit", 10)
+		limit, err := argInt(req, "limit", 10)
+		if err != nil {
+			return errResult(err.Error()), nil
+		}
 
-		const query = `query OrderFulfillmentsClosed {
+		closed, err := getClosedFulfillments(ctx, c)
+		if err != nil {
+			return errResult(fmt.Sprintf("Failed to get past orders: %v", err)), nil
+		}
+
+		type orderEntry struct {
+			ID           int     `json:"id"`
+			Date         string  `json:"date,omitempty"`
+			DateDisplay  string  `json:"date_display,omitempty"`
+			TimeWindow   string  `json:"time_window,omitempty"`
+			TotalPrice   float64 `json:"total_price"`
+			Status       string  `json:"status"`
+			StatusCode   int     `json:"status_code"`
+			Cancelled    bool    `json:"cancelled"`
+			Delivered    bool    `json:"delivered"`
+			ShoppingType string  `json:"shopping_type,omitempty"`
+		}
+		results := make([]orderEntry, 0)
+		for i, f := range closed {
+			if i >= limit {
+				break
+			}
+			// transactionCompleted is true on open and cancelled orders too, so a
+			// closed order counts as delivered unless it was cancelled.
+			cancelled := isCancelledStatus(f.StatusDescription, f.Delivery.Status)
+			results = append(results, orderEntry{
+				ID:           f.OrderID,
+				Date:         f.Delivery.Slot.Date,
+				DateDisplay:  f.Delivery.Slot.DateDisplay,
+				TimeWindow:   f.Delivery.Slot.TimeDisplay,
+				TotalPrice:   f.TotalPrice.TotalPrice.Amount,
+				Status:       f.StatusDescription,
+				StatusCode:   f.StatusCode,
+				Cancelled:    cancelled,
+				Delivered:    !cancelled,
+				ShoppingType: f.ShoppingType,
+			})
+		}
+		if len(results) == 0 {
+			return mcp.NewToolResultText("No past orders found."), nil
+		}
+		return jsonResult(results)
+	})
+}
+
+const closedFulfillmentsQuery = `query OrderFulfillmentsClosed {
   orderFulfillments(status: CLOSED) {
     result {
       orderId
@@ -147,65 +213,41 @@ func registerGetPastOrders(s *server.MCPServer, deps Deps) {
     }
   }
 }`
-		type fulfillmentResult struct {
-			OrderID           int    `json:"orderId"`
-			StatusDescription string `json:"statusDescription"`
-			ShoppingType      string `json:"shoppingType"`
-			TotalPrice        struct {
-				TotalPrice struct {
-					Amount float64 `json:"amount"`
-				} `json:"totalPrice"`
-			} `json:"totalPrice"`
-			Delivery struct {
-				Status string `json:"status"`
-				Slot   struct {
-					Date        string `json:"date"`
-					DateDisplay string `json:"dateDisplay"`
-					TimeDisplay string `json:"timeDisplay"`
-				} `json:"slot"`
-			} `json:"delivery"`
-		}
-		type response struct {
-			OrderFulfillments struct {
-				Result []fulfillmentResult `json:"result"`
-			} `json:"orderFulfillments"`
-		}
-		var resp response
-		if err := c.DoGraphQL(ctx, query, nil, &resp); err != nil {
-			return errResult(fmt.Sprintf("Failed to get past orders: %v", err)), nil
-		}
 
-		type orderEntry struct {
-			ID           int     `json:"id"`
-			Date         string  `json:"date,omitempty"`
-			TimeWindow   string  `json:"time_window,omitempty"`
-			TotalPrice   float64 `json:"total_price"`
-			Status       string  `json:"status"`
-			ShoppingType string  `json:"shopping_type,omitempty"`
-		}
-		results := make([]orderEntry, 0)
-		for i, f := range resp.OrderFulfillments.Result {
-			if i >= limit {
-				break
-			}
-			date := f.Delivery.Slot.DateDisplay
-			if date == "" {
-				date = f.Delivery.Slot.Date
-			}
-			results = append(results, orderEntry{
-				ID:           f.OrderID,
-				Date:         date,
-				TimeWindow:   f.Delivery.Slot.TimeDisplay,
-				TotalPrice:   f.TotalPrice.TotalPrice.Amount,
-				Status:       f.StatusDescription,
-				ShoppingType: f.ShoppingType,
-			})
-		}
-		if len(results) == 0 {
-			return mcp.NewToolResultText("No past orders found."), nil
-		}
-		return jsonResult(results)
-	})
+type closedFulfillment struct {
+	OrderID              int    `json:"orderId"`
+	StatusCode           int    `json:"statusCode"`
+	StatusDescription    string `json:"statusDescription"`
+	ShoppingType         string `json:"shoppingType"`
+	TransactionCompleted bool   `json:"transactionCompleted"`
+	TotalPrice           struct {
+		TotalPrice struct {
+			Amount float64 `json:"amount"`
+		} `json:"totalPrice"`
+	} `json:"totalPrice"`
+	Delivery struct {
+		Status string             `json:"status"`
+		Slot   appie.DeliverySlot `json:"slot"`
+	} `json:"delivery"`
+}
+
+func getClosedFulfillments(ctx context.Context, c *appie.Client) ([]closedFulfillment, error) {
+	var resp struct {
+		OrderFulfillments struct {
+			Result []closedFulfillment `json:"result"`
+		} `json:"orderFulfillments"`
+	}
+	if err := c.DoGraphQL(ctx, closedFulfillmentsQuery, nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.OrderFulfillments.Result, nil
+}
+
+// isCancelledStatus matches the status texts because AH's numeric statusCode
+// values are undocumented.
+func isCancelledStatus(description, deliveryStatus string) bool {
+	return strings.EqualFold(deliveryStatus, "CANCELLED") ||
+		strings.Contains(strings.ToLower(description), "annul")
 }
 
 // --- ah_get_frequent_items ---
@@ -219,13 +261,13 @@ func registerGetFrequentItems(s *server.MCPServer, deps Deps) {
 				"and returns products ordered at least min_order_count times. "+
 				"Returns product_name, product_id, order_count, last_ordered_date.",
 		),
-		mcp.WithString("min_order_count",
+		mcp.WithNumber("min_order_count",
 			mcp.Description("Minimum number of orders a product must appear in (default 3)"),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -235,7 +277,10 @@ func registerGetFrequentItems(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Client error: %v", err)), nil
 		}
 
-		minCount := req.GetInt("min_order_count", 3)
+		minCount, err := argInt(req, "min_order_count", 3)
+		if err != nil {
+			return errResult(err.Error()), nil
+		}
 
 		// Fetch both open and past (CLOSED) fulfillments so we have a full history.
 		openFulfillments, err := c.GetFulfillments(ctx)
@@ -254,7 +299,9 @@ func registerGetFrequentItems(s *server.MCPServer, deps Deps) {
 		type closedResult struct {
 			OrderID  int `json:"orderId"`
 			Delivery struct {
-				Slot struct{ Date string `json:"date"` } `json:"slot"`
+				Slot struct {
+					Date string `json:"date"`
+				} `json:"slot"`
 			} `json:"delivery"`
 		}
 		type closedResp struct {
@@ -358,13 +405,13 @@ func registerGetReceipts(s *server.MCPServer, deps Deps) {
 				"Returns receipt id, date, and total amount. "+
 				"Use ah_get_receipt_details with the id to see individual items.",
 		),
-		mcp.WithString("limit",
+		mcp.WithNumber("limit",
 			mcp.Description("Maximum number of receipts to return (default 10)"),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -374,7 +421,10 @@ func registerGetReceipts(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Client error: %v", err)), nil
 		}
 
-		limit := req.GetInt("limit", 10)
+		limit, err := argInt(req, "limit", 10)
+		if err != nil {
+			return errResult(err.Error()), nil
+		}
 
 		receipts, err := c.GetReceipts(ctx)
 		if err != nil {
@@ -424,7 +474,7 @@ func registerGetReceiptDetails(s *server.MCPServer, deps Deps) {
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -499,17 +549,20 @@ func registerGetOrderDetails(s *server.MCPServer, deps Deps) {
 		mcp.WithTitleAnnotation("Albert Heijn: Order Details"),
 		mcp.WithDescription(
 			"Get the full item list for a specific Albert Heijn delivery order by its ID. "+
-				"Returns all products with names, quantities, and prices. "+
+				"Returns all products with names, quantities, and prices, plus "+
+				"closing_time (change deadline, RFC3339 Brussels time) and after_cutoff. "+
+				"total_price is the order total (from the active cart or the order lists); "+
+				"total_discount is only known for the active order. Both are omitted when unknown. "+
 				"Get order_id from ah_get_order_history.",
 		),
-		mcp.WithString("order_id",
+		mcp.WithNumber("order_id",
 			mcp.Required(),
 			mcp.Description("Numeric order ID from ah_get_order_history"),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -519,7 +572,10 @@ func registerGetOrderDetails(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Client error: %v", err)), nil
 		}
 
-		orderID := req.GetInt("order_id", 0)
+		orderID, err := argInt(req, "order_id", 0)
+		if err != nil {
+			return errResult(err.Error()), nil
+		}
 		if orderID == 0 {
 			return errResult("order_id is required"), nil
 		}
@@ -538,9 +594,11 @@ func registerGetOrderDetails(s *server.MCPServer, deps Deps) {
 		type orderResult struct {
 			ID            string      `json:"id"`
 			State         string      `json:"state"`
+			ClosingTime   string      `json:"closing_time,omitempty"`
+			AfterCutoff   *bool       `json:"after_cutoff,omitempty"`
 			Items         []itemEntry `json:"items"`
-			TotalPrice    float64     `json:"total_price"`
-			TotalDiscount float64     `json:"total_discount,omitempty"`
+			TotalPrice    *float64    `json:"total_price,omitempty"`
+			TotalDiscount *float64    `json:"total_discount,omitempty"`
 		}
 
 		items := make([]itemEntry, 0, len(order.Items))
@@ -552,14 +610,71 @@ func registerGetOrderDetails(s *server.MCPServer, deps Deps) {
 			}
 			items = append(items, ie)
 		}
+		closing, closingAt, ok := formatClosingTime(order.ClosingTime)
+		var afterCutoff *bool
+		if ok {
+			passed := time.Now().After(closingAt)
+			afterCutoff = &passed
+		}
+		total, discount := orderTotals(ctx, c, orderID)
 		return jsonResult(orderResult{
 			ID:            order.ID,
 			State:         order.State,
+			ClosingTime:   closing,
+			AfterCutoff:   afterCutoff,
 			Items:         items,
-			TotalPrice:    order.TotalPrice,
-			TotalDiscount: order.TotalDiscount,
+			TotalPrice:    total,
+			TotalDiscount: discount,
 		})
 	})
+}
+
+// brussels is the AH BE store timezone, falling back to UTC if unknown.
+var brussels = func() *time.Location {
+	loc, err := time.LoadLocation("Europe/Brussels")
+	if err != nil {
+		return time.UTC
+	}
+	return loc
+}()
+
+// orderTotals looks up the totals that details-grouped-by-taxonomy does not
+// return: the active order summary first, then the open and closed order lists.
+// Nil means the order was not found.
+func orderTotals(ctx context.Context, c *appie.Client, orderID int) (total, discount *float64) {
+	if o, err := c.GetOrder(ctx); err == nil && o.ID == strconv.Itoa(orderID) {
+		return &o.TotalPrice, &o.TotalDiscount
+	}
+	if open, err := c.GetFulfillments(ctx); err == nil {
+		for _, f := range open {
+			if f.OrderID == orderID {
+				return &f.TotalPrice, nil
+			}
+		}
+	}
+	if closed, err := getClosedFulfillments(ctx, c); err == nil {
+		for _, f := range closed {
+			if f.OrderID == orderID {
+				return &f.TotalPrice.TotalPrice.Amount, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
+// formatClosingTime renders an AH closing time as RFC3339 in Brussels time.
+// The API types it as a plain string, so a value without a zone is read as
+// Brussels wall time and an unparseable value is passed through unchanged
+// with ok false.
+func formatClosingTime(raw string) (formatted string, at time.Time, ok bool) {
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		t = t.In(brussels)
+		return t.Format(time.RFC3339), t, true
+	}
+	if t, err := time.ParseInLocation("2006-01-02T15:04:05", raw, brussels); err == nil {
+		return t.Format(time.RFC3339), t, true
+	}
+	return raw, time.Time{}, false
 }
 
 // --- ah_get_cart ---
@@ -569,14 +684,19 @@ func registerGetCart(s *server.MCPServer, deps Deps) {
 		mcp.WithTitleAnnotation("Albert Heijn: View Cart"),
 		mcp.WithDescription(
 			"View the current Albert Heijn online shopping cart (active order). "+
-				"Returns the order state, all items with names and quantities, "+
-				"total price, and total discount. "+
+				"Returns the order state, total_items (distinct product lines), total_price, total_discount, and all items "+
+				"with name, quantity, price_before_bonus, current_price (bonus price, absent when "+
+				"the discount applies per group such as \"2e gratis\"), is_bonus and bonus_mechanism. "+
+				"Lines without price fields could not be matched to the order details. "+
+				"unavailable lists basket lines AH will not deliver, each with product_id, name, quantity and reason: "+
+				"sold_out (\"Tijdelijk uitverkocht\", still in items) or store_only (\"Alleen in de winkel\", not in items). "+
+				"It is omitted when every line is deliverable or the check failed. "+
 				"Use ah_update_cart_item or ah_remove_from_cart to modify items.",
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -587,40 +707,107 @@ func registerGetCart(s *server.MCPServer, deps Deps) {
 		}
 
 		order, err := c.GetOrder(ctx)
+		if isNoActiveOrder(err) {
+			return jsonResult(map[string]any{
+				"state": "NONE",
+				"items": []any{},
+				"hint":  noActiveOrderHint,
+			})
+		}
 		if err != nil {
 			return errResult(fmt.Sprintf("Failed to get cart: %v", err)), nil
 		}
 
 		type cartItem struct {
-			ProductID int     `json:"product_id"`
-			Name      string  `json:"name,omitempty"`
-			Quantity  int     `json:"quantity"`
-			Price     float64 `json:"price,omitempty"`
+			ProductID int    `json:"product_id"`
+			Name      string `json:"name,omitempty"`
+			Quantity  int    `json:"quantity"`
+			*linePrice
 		}
 		type cartResult struct {
-			ID            string     `json:"id"`
-			State         string     `json:"state"`
-			Items         []cartItem `json:"items"`
-			TotalPrice    float64    `json:"total_price"`
-			TotalDiscount float64    `json:"total_discount,omitempty"`
+			ID            string                    `json:"id"`
+			State         string                    `json:"state"`
+			TotalItems    int                       `json:"total_items"`
+			Items         []cartItem                `json:"items"`
+			Unavailable   []appie.BasketUnavailable `json:"unavailable,omitempty"`
+			TotalPrice    float64                   `json:"total_price"`
+			TotalDiscount float64                   `json:"total_discount,omitempty"`
 		}
+		prices := cartLinePrices(ctx, c, order.ID)
 		items := make([]cartItem, 0, len(order.Items))
 		for _, it := range order.Items {
-			ci := cartItem{ProductID: it.ProductID, Quantity: it.Quantity}
+			ci := cartItem{ProductID: it.ProductID, Quantity: it.Quantity, linePrice: prices[it.ProductID]}
 			if it.Product != nil {
 				ci.Name = it.Product.Title
-				ci.Price = it.Product.Price.Now
 			}
 			items = append(items, ci)
+		}
+		// The order summary lists sold-out lines like any other; only the gql
+		// basket flags them. A failed check leaves the cart as it was.
+		unavailable, err := c.GetBasketUnavailable(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[Albert Heijn MCP] Warning: no availability check for cart: %v\n", err)
 		}
 		return jsonResult(cartResult{
 			ID:            order.ID,
 			State:         order.State,
+			TotalItems:    len(items),
 			Items:         items,
+			Unavailable:   unavailable,
 			TotalPrice:    order.TotalPrice,
 			TotalDiscount: order.TotalDiscount,
 		})
 	})
+}
+
+const noActiveOrderHint = "No active order. Call ah_reopen_order(order_id) with a modifiable id from ah_get_order_history."
+
+// linePrice holds the per-line prices that only the order details return.
+type linePrice struct {
+	PriceBeforeBonus float64  `json:"price_before_bonus"`
+	CurrentPrice     *float64 `json:"current_price,omitempty"`
+	IsBonus          bool     `json:"is_bonus"`
+	BonusMechanism   string   `json:"bonus_mechanism,omitempty"`
+}
+
+// cartLinePrices fetches the active order's details and indexes their prices
+// by product id. The summary behind the cart carries no prices. A failed
+// lookup returns no prices instead of failing the cart.
+func cartLinePrices(ctx context.Context, c *appie.Client, orderID string) map[int]*linePrice {
+	id, err := strconv.Atoi(orderID)
+	if err != nil {
+		return nil
+	}
+	details, err := c.GetOrderDetails(ctx, id)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[Albert Heijn MCP] Warning: no cart prices, order %d details: %v\n", id, err)
+		return nil
+	}
+	prices := make(map[int]*linePrice, len(details.Items))
+	for _, it := range details.Items {
+		if it.Product == nil || prices[it.ProductID] != nil {
+			continue
+		}
+		p := it.Product
+		lp := &linePrice{PriceBeforeBonus: p.Price.Now, IsBonus: p.IsBonus, BonusMechanism: p.BonusMechanism}
+		// GetOrderDetails sets Was only when AH sent a currentPrice.
+		if p.Price.Was != 0 {
+			now := p.Price.Now
+			lp.PriceBeforeBonus, lp.CurrentPrice = p.Price.Was, &now
+		}
+		prices[it.ProductID] = lp
+	}
+	return prices
+}
+
+// isNoActiveOrder reports whether err is AH's answer when no order is
+// reopened or the reopen has lapsed.
+func isNoActiveOrder(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Order should not be null") || strings.Contains(msg, "Order does not exist")
 }
 
 // --- ah_get_cart_summary ---
@@ -630,12 +817,13 @@ func registerGetCartSummary(s *server.MCPServer, deps Deps) {
 		mcp.WithTitleAnnotation("Albert Heijn: Cart Summary"),
 		mcp.WithDescription(
 			"Get the Albert Heijn shopping cart totals: number of items, "+
-				"total price, discount amount, and delivery cost.",
+				"total price and discount amount. No delivery cost is returned. "+
+				"ah_get_cart returns the same totals plus the lines.",
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -663,18 +851,18 @@ func registerUpdateCartItem(s *server.MCPServer, deps Deps) {
 				"Use product_id from ah_search_products or ah_get_cart. "+
 				"Set quantity=0 to remove the item (or use ah_remove_from_cart).",
 		),
-		mcp.WithString("product_id",
+		mcp.WithNumber("product_id",
 			mcp.Required(),
 			mcp.Description("Numeric product ID"),
 		),
-		mcp.WithString("quantity",
+		mcp.WithNumber("quantity",
 			mcp.Required(),
 			mcp.Description("New quantity (0 removes the item)"),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -684,11 +872,17 @@ func registerUpdateCartItem(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Client error: %v", err)), nil
 		}
 
-		productID := req.GetInt("product_id", 0)
+		productID, err := argInt(req, "product_id", 0)
+		if err != nil {
+			return errResult(err.Error()), nil
+		}
 		if productID == 0 {
 			return errResult("product_id is required"), nil
 		}
-		quantity := req.GetInt("quantity", -1)
+		quantity, err := argInt(req, "quantity", -1)
+		if err != nil {
+			return errResult(err.Error()), nil
+		}
 		if quantity < 0 {
 			return errResult("quantity is required and must be >= 0"), nil
 		}
@@ -718,14 +912,14 @@ func registerRemoveFromCart(s *server.MCPServer, deps Deps) {
 			"Remove a single product from the Albert Heijn shopping cart. "+
 				"Use product_id from ah_search_products or ah_get_cart.",
 		),
-		mcp.WithString("product_id",
+		mcp.WithNumber("product_id",
 			mcp.Required(),
 			mcp.Description("Numeric product ID to remove"),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -735,7 +929,10 @@ func registerRemoveFromCart(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Client error: %v", err)), nil
 		}
 
-		productID := req.GetInt("product_id", 0)
+		productID, err := argInt(req, "product_id", 0)
+		if err != nil {
+			return errResult(err.Error()), nil
+		}
 		if productID == 0 {
 			return errResult("product_id is required"), nil
 		}
@@ -768,7 +965,7 @@ func registerClearCart(s *server.MCPServer, deps Deps) {
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if req.GetString("confirm", "") != "yes" {
 			return errResult(`confirm must be "yes" to clear the cart`), nil
@@ -794,21 +991,21 @@ func registerReopenOrder(s *server.MCPServer, deps Deps) {
 	tool := mcp.NewTool("ah_reopen_order",
 		mcp.WithTitleAnnotation("Albert Heijn: Reopen Order for Editing"),
 		mcp.WithDescription(
-			"Unlock a submitted AH delivery order so its items can be changed. "+
-				"The order becomes the active order again (REOPENED state). "+
-				"IMPORTANT: You MUST call ah_revert_order when done, even if editing fails — "+
-				"otherwise the order stays unlocked and interferes with new orders. "+
+			"Unlock a submitted AH delivery order so its items can be changed (REOPENED state). "+
+				"Leave it REOPENED when done; the user reviews and checks out in the AH app. "+
+				"While reopened, this client treats it as the active order for the session. "+
+				"Do NOT call ah_revert_order to finish: it reverts to the pre-reopen order and discards edits. "+
 				"Only works before the order's closing time; returns an error if too late. "+
 				"Get order_id from ah_get_order_history (check modifiable=true first).",
 		),
-		mcp.WithString("order_id",
+		mcp.WithNumber("order_id",
 			mcp.Required(),
 			mcp.Description("Numeric order ID from ah_get_order_history"),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -818,7 +1015,10 @@ func registerReopenOrder(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Client error: %v", err)), nil
 		}
 
-		orderID := req.GetInt("order_id", 0)
+		orderID, err := argInt(req, "order_id", 0)
+		if err != nil {
+			return errResult(err.Error()), nil
+		}
 		if orderID == 0 {
 			return errResult("order_id is required"), nil
 		}
@@ -827,7 +1027,7 @@ func registerReopenOrder(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Failed to reopen order %d: %v", orderID, err)), nil
 		}
 		return mcp.NewToolResultText(fmt.Sprintf(
-			"Order %d is now unlocked (REOPENED). Use ah_update_order_items to make changes, then call ah_revert_order when done.",
+			"Order %d is REOPENED. Use ah_update_order_items to edit. Leave it reopened for the user to check out in the app.",
 			orderID,
 		)), nil
 	})
@@ -842,24 +1042,28 @@ func registerUpdateOrderItems(s *server.MCPServer, deps Deps) {
 			"Add, update, or remove items from the currently active AH order. "+
 				"Set quantity=0 to remove an item. "+
 				"Use after ah_reopen_order to edit a submitted delivery order. "+
-				"Returns confirmation of the update.",
+				"Reads the order back and reports, for the sent product IDs only: "+
+				"landed [{id,qty}], rejected [id] (sent with qty>0 but missing, e.g. not in the delivery slot assortment), "+
+				"qty_mismatch [{id,want,got}], removed [id], "+
+				"sold_out [id] (in the order at the sent qty but \"Tijdelijk uitverkocht\", so not delivered; not in landed), "+
+				"availability_error when the sold-out check failed, plus order_id, total_items and total_price, "+
+				"and reopened_order_id when it reopened an order. "+
+				"Empty lists are omitted. "+
+				"If order_id is given and it is not the active order (no order is active, or a different one is), "+
+				"it reopens order_id first. The write only goes to order_id.",
+		),
+		mcp.WithNumber("order_id",
+			mcp.Description("Optional modifiable order ID from ah_get_order_history. The write only goes to this order; it is reopened if it is not the active one."),
 		),
 		mcp.WithArray("items",
 			mcp.Required(),
 			mcp.Description(`Items to add/update/remove. Each: {"product_id": 123456, "quantity": 2} — set quantity=0 to remove.`),
-			mcp.Items(map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"product_id": map[string]any{"type": "integer"},
-					"quantity":   map[string]any{"type": "integer"},
-				},
-				"required": []string{"product_id", "quantity"},
-			}),
+			mcp.Items(itemSchema("product_id", "quantity")),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -869,52 +1073,57 @@ func registerUpdateOrderItems(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Client error: %v", err)), nil
 		}
 
-		rawItems, ok := req.GetArguments()["items"]
-		if !ok {
-			return errResult("items parameter is required"), nil
+		// A malformed quantity must not be read as 0, which would remove the item.
+		items, err := parseItems("items", req.GetArguments()["items"], -1)
+		if err != nil {
+			return errResult(err.Error()), nil
 		}
-		itemList, ok := rawItems.([]any)
-		if !ok {
-			return errResult("items must be an array"), nil
+		if len(items) == 0 {
+			return errResult("items array is empty"), nil
 		}
-
-		orderItems := make([]appie.OrderItem, 0, len(itemList))
-		for _, raw := range itemList {
-			m, mOK := raw.(map[string]any)
-			if !mOK {
-				continue
-			}
-			pid := toInt(m["product_id"])
-			qty := toInt(m["quantity"])
-			if pid > 0 {
-				orderItems = append(orderItems, appie.OrderItem{ProductID: pid, Quantity: qty})
-			}
-		}
-		if len(orderItems) == 0 {
-			return errResult("no valid items provided"), nil
+		orderItems := make([]appie.OrderItem, 0, len(items))
+		for _, it := range items {
+			orderItems = append(orderItems, appie.OrderItem{ProductID: it.ProductID, Quantity: it.Quantity})
 		}
 
-		// GetOrder must be called first to cache the active order ID for the header.
-		if _, err := c.GetOrder(ctx); err != nil {
+		orderID, err := argInt(req, "order_id", 0)
+		if err != nil {
+			return errResult(err.Error()), nil
+		}
+		before, err := c.GetOrder(ctx)
+		noActive := isNoActiveOrder(err)
+		if err != nil && !noActive {
 			return errResult(fmt.Sprintf("Failed to get active order: %v", err)), nil
 		}
+		if noActive && orderID == 0 {
+			return errResult(noActiveOrderHint + " Or pass order_id to reopen it automatically."), nil
+		}
+		reopenedID := 0
+		if orderID != 0 && (noActive || before.ID != strconv.Itoa(orderID)) {
+			active := "no order"
+			if !noActive {
+				active = "order " + before.ID
+			}
+			if err := c.ReopenOrder(ctx, orderID); err != nil {
+				return errResult(fmt.Sprintf("Reopening order %d failed, nothing written (active: %s): %v", orderID, active, err)), nil
+			}
+			if before, err = c.GetOrder(ctx); err != nil {
+				return errResult(fmt.Sprintf("Reopened order %d but reading it failed, nothing written: %v", orderID, err)), nil
+			}
+			if before.ID != strconv.Itoa(orderID) {
+				return errResult(fmt.Sprintf("Reopened order %d but the active order is %s, nothing written.", orderID, before.ID)), nil
+			}
+			reopenedID = orderID
+		}
 
-		if err := c.AddToOrder(ctx, orderItems); err != nil {
+		res, err := c.AddToOrderCheckedFrom(ctx, before, orderItems)
+		if err != nil {
 			return errResult(fmt.Sprintf("Failed to update order items: %v", err)), nil
 		}
-
-		added, removed := 0, 0
-		for _, it := range orderItems {
-			if it.Quantity == 0 {
-				removed++
-			} else {
-				added++
-			}
-		}
-		return mcp.NewToolResultText(fmt.Sprintf(
-			"Order updated: %d item(s) added/changed, %d item(s) removed. Call ah_revert_order to resubmit.",
-			added, removed,
-		)), nil
+		return jsonResult(struct {
+			*appie.BasketWriteResult
+			ReopenedOrderID int `json:"reopened_order_id,omitempty"`
+		}{res, reopenedID})
 	})
 }
 
@@ -922,20 +1131,21 @@ func registerUpdateOrderItems(s *server.MCPServer, deps Deps) {
 
 func registerRevertOrder(s *server.MCPServer, deps Deps) {
 	tool := mcp.NewTool("ah_revert_order",
-		mcp.WithTitleAnnotation("Albert Heijn: Resubmit Order"),
+		mcp.WithTitleAnnotation("Albert Heijn: Abort Reopened Order (discards edits)"),
 		mcp.WithDescription(
-			"Resubmit a reopened AH delivery order back to its scheduled/submitted state. "+
-				"ALWAYS call this after ah_reopen_order, whether editing succeeded or failed. "+
-				"Clears the active order state on the client so the shopping cart works normally again.",
+			"Revert a reopened AH delivery order to its pre-reopen submitted state; this discards all edits made since ah_reopen_order. "+
+				"Only call it when the user explicitly asks to abort their changes. "+
+				"Do not call it to finish editing: leave the order REOPENED for the user to check out in the app. "+
+				"Also clears the client's active order state.",
 		),
-		mcp.WithString("order_id",
+		mcp.WithNumber("order_id",
 			mcp.Required(),
 			mcp.Description("Numeric order ID — same value passed to ah_reopen_order"),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
+			return notAuthResult(deps), nil
 		}
 		if err := refreshTokens(ctx, deps); err != nil {
 			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
@@ -945,7 +1155,10 @@ func registerRevertOrder(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Client error: %v", err)), nil
 		}
 
-		orderID := req.GetInt("order_id", 0)
+		orderID, err := argInt(req, "order_id", 0)
+		if err != nil {
+			return errResult(err.Error()), nil
+		}
 		if orderID == 0 {
 			return errResult("order_id is required"), nil
 		}
@@ -954,7 +1167,7 @@ func registerRevertOrder(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Failed to revert order %d: %v", orderID, err)), nil
 		}
 		return mcp.NewToolResultText(fmt.Sprintf(
-			"Order %d has been resubmitted. Your delivery is back on schedule.",
+			"Order %d reverted to its pre-reopen state; edits since reopen were discarded.",
 			orderID,
 		)), nil
 	})

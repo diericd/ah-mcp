@@ -250,7 +250,7 @@ Tokens are stored automatically at `/home/ah-mcp/.config/ah-mcp/tokens.json` —
 | Tool | Description |
 |---|---|
 | `ah_get_cart` | View current online cart: items, quantities, total price. |
-| `ah_get_cart_summary` | Cart totals only: item count, price, discount, delivery cost. |
+| `ah_get_cart_summary` | Cart totals only: line count, price, discount. No delivery cost. |
 | `ah_update_cart_item` | Set quantity for a product in the cart (0 removes it). |
 | `ah_remove_from_cart` | Remove a single product from the cart. |
 | `ah_clear_cart` | Remove all items from the cart. Requires `confirm=yes`. |
@@ -259,13 +259,13 @@ Tokens are stored automatically at `/home/ah-mcp/.config/ah-mcp/tokens.json` —
 
 | Tool | Description |
 |---|---|
-| `ah_get_order_history` | Upcoming delivery orders with status and modifiable flag. |
+| `ah_get_order_history` | Upcoming delivery orders with status, modifiable, reopenable, closing_time and after_cutoff. The last three stay empty if AH rejects those fields. |
 | `ah_get_past_orders` | Past/delivered orders. |
 | `ah_get_order_details` | Full item list for a specific past or upcoming order. |
 | `ah_get_frequent_items` | Products you order most often, ranked by frequency. |
-| `ah_reopen_order` | Unlock a submitted order for editing (before closing time). ⚠️ unconfirmed |
-| `ah_update_order_items` | Add/change/remove items in a reopened order. ⚠️ unconfirmed |
-| `ah_revert_order` | Resubmit a reopened order. **Always call this after `ah_reopen_order`.** ⚠️ unconfirmed |
+| `ah_reopen_order` | Unlock a submitted order for editing (before closing time). Leave it reopened; the user checks out in the app. |
+| `ah_update_order_items` | Add/change/remove items in the active order. With `order_id`, writes only to that order and reopens it if another (or no) order is active. Returns `order_id`, `landed`, `rejected`, `qty_mismatch`, `removed`, `total_items` (distinct lines) and `total_price`, read back from the order. |
+| `ah_revert_order` | Abort a reopen: restores the pre-reopen order and **discards all edits**. Only when the user asks to abort. |
 
 ### Shopping list
 
@@ -277,7 +277,7 @@ Tokens are stored automatically at `/home/ah-mcp/.config/ah-mcp/tokens.json` —
 | `ah_remove_from_shopping_list` | Remove items by product ID or free-text name. |
 | `ah_check_shopping_list_item` | Tick or untick an item on the list. ⚠️ broken (listItemId=0 in API) |
 | `ah_clear_shopping_list` | Remove all items from the list. Requires `confirm=yes`. |
-| `ah_shopping_list_to_order` | Move all unchecked product items from your list to the cart. |
+| `ah_shopping_list_to_order` | Move all unchecked product items from your list to the cart. Returns the same read-back report as `ah_update_order_items`. |
 | `ah_get_favorite_lists` | List all named favourite lists with IDs. |
 | `ah_add_to_favorite_list` | Add products to a named favourite list. |
 | `ah_remove_from_favorite_list` | Remove products from a named favourite list. |
