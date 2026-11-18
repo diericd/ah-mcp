@@ -27,9 +27,10 @@ func pricesServer(t *testing.T, detailsOK bool) *httptest.Server {
 		switch {
 		case r.URL.Path == "/graphql":
 			body, _ := io.ReadAll(r.Body)
-			if strings.Contains(string(body), "BasketAvailability") {
-				// Brood (3) is sold out; 9 was kept out of the order (store only).
-				zero := 0
+			if strings.Contains(string(body), "query Basket") {
+				// Brood (3) is sold out; 9 was kept out of the order (store only);
+				// Witlof (565848) is a BE web-only line the order does not list.
+				zero, two := 0, 2
 				item := func(id, qty int, allocated *int, orderable bool, title string) map[string]any {
 					return map[string]any{"id": id, "quantity": qty, "allocatedQuantity": allocated, "product": map[string]any{
 						"title": title, "availability": map[string]any{"isOrderable": orderable},
@@ -39,6 +40,11 @@ func pricesServer(t *testing.T, detailsOK bool) *httptest.Server {
 					item(1, 2, &zero, true, "Kaas"),
 					item(3, 1, &zero, false, "Brood"),
 					item(9, 1, nil, false, "Frambozen"),
+					{"id": 565848, "quantity": 2, "allocatedQuantity": &two, "product": map[string]any{
+						"title": "AH Witlof", "salesUnitSize": "500 g",
+						"price":        map[string]any{"now": map[string]any{"amount": 3.79}},
+						"availability": map[string]any{"isOrderable": true},
+					}},
 				}}}})
 				return
 			}
@@ -135,13 +141,21 @@ func TestGetCartJoinsLinePrices(t *testing.T) {
 	}
 	text := decodeText(t, callOrderTool(t, s, "ah_get_cart", map[string]any{}), &got)
 
-	if got.TotalItems != 3 || got.TotalPrice != 10.5 || got.TotalDiscount != 1.25 {
-		t.Errorf("totals = %d/%v/%v, want 3/10.5/1.25 in %s", got.TotalItems, got.TotalPrice, got.TotalDiscount, text)
+	if got.TotalItems != 4 || got.TotalPrice != 10.5 || got.TotalDiscount != 1.25 {
+		t.Errorf("totals = %d/%v/%v, want 4/10.5/1.25 in %s", got.TotalItems, got.TotalPrice, got.TotalDiscount, text)
 	}
-	if len(got.Items) != 3 {
-		t.Fatalf("items = %d, want 3: %s", len(got.Items), text)
+	if len(got.Items) != 4 {
+		t.Fatalf("items = %d, want 4: %s", len(got.Items), text)
 	}
-	kaas, melk, brood := got.Items[0], got.Items[1], got.Items[2]
+	kaas, melk, brood, witlof := got.Items[0], got.Items[1], got.Items[2], got.Items[3]
+	// The web-only line comes from the gql basket, with its unit price.
+	if witlof["product_id"] != 565848.0 || witlof["name"] != "AH Witlof 500 g" || witlof["quantity"] != 2.0 ||
+		witlof["price_before_bonus"] != 3.79 || witlof["web_only"] != true {
+		t.Errorf("web-only line = %v", witlof)
+	}
+	if _, ok := kaas["web_only"]; ok {
+		t.Errorf("an order line must not be marked web_only: %v", kaas)
+	}
 	if kaas["price_before_bonus"] != 4.0 || kaas["current_price"] != 3.0 ||
 		kaas["is_bonus"] != true || kaas["bonus_mechanism"] != "25% korting" {
 		t.Errorf("bonus line = %v", kaas)
@@ -168,8 +182,8 @@ func TestGetCartDetailsFailureKeepsLines(t *testing.T) {
 		Items      []map[string]any `json:"items"`
 	}
 	text := decodeText(t, callOrderTool(t, s, "ah_get_cart", map[string]any{}), &got)
-	if len(got.Items) != 3 || got.TotalPrice != 10.5 {
-		t.Errorf("want 3 lines and total 10.5 without details, got %s", text)
+	if len(got.Items) != 4 || got.TotalPrice != 10.5 {
+		t.Errorf("want 4 lines and total 10.5 without details, got %s", text)
 	}
 }
 
@@ -269,8 +283,9 @@ func TestGetCartReportsUnavailable(t *testing.T) {
 			t.Errorf("unavailable[%d] = %+v, want %+v", i, got.Unavailable[i], want[i])
 		}
 	}
-	// A sold-out line stays in items: it is still in the order.
-	if len(got.Items) != 3 {
-		t.Errorf("items = %d, want 3: %s", len(got.Items), text)
+	// A sold-out line stays in items: it is still in the order. The fourth
+	// line is the web-only witlof.
+	if len(got.Items) != 4 {
+		t.Errorf("items = %d, want 4: %s", len(got.Items), text)
 	}
 }
