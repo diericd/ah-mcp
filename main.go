@@ -94,6 +94,9 @@ func main() {
 		StartOAuthFlow: func(ctx context.Context) (string, <-chan error, error) {
 			return StartOAuthFlow(ctx, callbackHost, callbackPort, tokensPath)
 		},
+		ExchangeCode: func(ctx context.Context, code string) error {
+			return exchangeCodeAndSave(ctx, code, tokensPath)
+		},
 		RefreshIfNeeded: RefreshClientTokens,
 		TokenStatus: func() string {
 			return TokenStatus(tokensPath)
