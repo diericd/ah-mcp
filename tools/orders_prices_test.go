@@ -27,6 +27,21 @@ func pricesServer(t *testing.T, detailsOK bool) *httptest.Server {
 		switch {
 		case r.URL.Path == "/graphql":
 			body, _ := io.ReadAll(r.Body)
+			if strings.Contains(string(body), "BasketAvailability") {
+				// Brood (3) is sold out; 9 was kept out of the order (store only).
+				zero := 0
+				item := func(id, qty int, allocated *int, orderable bool, title string) map[string]any {
+					return map[string]any{"id": id, "quantity": qty, "allocatedQuantity": allocated, "product": map[string]any{
+						"title": title, "availability": map[string]any{"isOrderable": orderable},
+					}}
+				}
+				json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"basket": map[string]any{"items": []map[string]any{
+					item(1, 2, &zero, true, "Kaas"),
+					item(3, 1, &zero, false, "Brood"),
+					item(9, 1, nil, false, "Frambozen"),
+				}}}})
+				return
+			}
 			closed := strings.Contains(string(body), "CLOSED")
 			id, amount := 888, 42.5
 			slot := map[string]any{"date": "2026-10-09", "dateDisplay": "vrijdag 9 oktober", "timeDisplay": "18:00 - 22:00"}
@@ -231,5 +246,31 @@ func TestIsCancelledStatus(t *testing.T) {
 		if got := isCancelledStatus(tt.desc, tt.delivery); got != tt.want {
 			t.Errorf("isCancelledStatus(%q, %q) = %v, want %v", tt.desc, tt.delivery, got, tt.want)
 		}
+	}
+}
+
+func TestGetCartReportsUnavailable(t *testing.T) {
+	s := pricesTool(t, true, registerGetCart)
+	var got struct {
+		Items       []map[string]any          `json:"items"`
+		Unavailable []appie.BasketUnavailable `json:"unavailable"`
+	}
+	text := decodeText(t, callOrderTool(t, s, "ah_get_cart", map[string]any{}), &got)
+
+	want := []appie.BasketUnavailable{
+		{ProductID: 3, Title: "Brood", Quantity: 1, Reason: appie.UnavailableSoldOut},
+		{ProductID: 9, Title: "Frambozen", Quantity: 1, Reason: appie.UnavailableStoreOnly},
+	}
+	if len(got.Unavailable) != len(want) {
+		t.Fatalf("unavailable = %+v, want %+v in %s", got.Unavailable, want, text)
+	}
+	for i := range want {
+		if got.Unavailable[i] != want[i] {
+			t.Errorf("unavailable[%d] = %+v, want %+v", i, got.Unavailable[i], want[i])
+		}
+	}
+	// A sold-out line stays in items: it is still in the order.
+	if len(got.Items) != 3 {
+		t.Errorf("items = %d, want 3: %s", len(got.Items), text)
 	}
 }

@@ -688,6 +688,9 @@ func registerGetCart(s *server.MCPServer, deps Deps) {
 				"with name, quantity, price_before_bonus, current_price (bonus price, absent when "+
 				"the discount applies per group such as \"2e gratis\"), is_bonus and bonus_mechanism. "+
 				"Lines without price fields could not be matched to the order details. "+
+				"unavailable lists basket lines AH will not deliver, each with product_id, name, quantity and reason: "+
+				"sold_out (\"Tijdelijk uitverkocht\", still in items) or store_only (\"Alleen in de winkel\", not in items). "+
+				"It is omitted when every line is deliverable or the check failed. "+
 				"Use ah_update_cart_item or ah_remove_from_cart to modify items.",
 		),
 	)
@@ -722,12 +725,13 @@ func registerGetCart(s *server.MCPServer, deps Deps) {
 			*linePrice
 		}
 		type cartResult struct {
-			ID            string     `json:"id"`
-			State         string     `json:"state"`
-			TotalItems    int        `json:"total_items"`
-			Items         []cartItem `json:"items"`
-			TotalPrice    float64    `json:"total_price"`
-			TotalDiscount float64    `json:"total_discount,omitempty"`
+			ID            string                    `json:"id"`
+			State         string                    `json:"state"`
+			TotalItems    int                       `json:"total_items"`
+			Items         []cartItem                `json:"items"`
+			Unavailable   []appie.BasketUnavailable `json:"unavailable,omitempty"`
+			TotalPrice    float64                   `json:"total_price"`
+			TotalDiscount float64                   `json:"total_discount,omitempty"`
 		}
 		prices := cartLinePrices(ctx, c, order.ID)
 		items := make([]cartItem, 0, len(order.Items))
@@ -738,11 +742,18 @@ func registerGetCart(s *server.MCPServer, deps Deps) {
 			}
 			items = append(items, ci)
 		}
+		// The order summary lists sold-out lines like any other; only the gql
+		// basket flags them. A failed check leaves the cart as it was.
+		unavailable, err := c.GetBasketUnavailable(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[Albert Heijn MCP] Warning: no availability check for cart: %v\n", err)
+		}
 		return jsonResult(cartResult{
 			ID:            order.ID,
 			State:         order.State,
 			TotalItems:    len(items),
 			Items:         items,
+			Unavailable:   unavailable,
 			TotalPrice:    order.TotalPrice,
 			TotalDiscount: order.TotalDiscount,
 		})
@@ -1033,7 +1044,9 @@ func registerUpdateOrderItems(s *server.MCPServer, deps Deps) {
 				"Use after ah_reopen_order to edit a submitted delivery order. "+
 				"Reads the order back and reports, for the sent product IDs only: "+
 				"landed [{id,qty}], rejected [id] (sent with qty>0 but missing, e.g. not in the delivery slot assortment), "+
-				"qty_mismatch [{id,want,got}], removed [id], plus order_id, total_items and total_price, "+
+				"qty_mismatch [{id,want,got}], removed [id], "+
+				"sold_out [id] (in the order at the sent qty but \"Tijdelijk uitverkocht\", so not delivered; not in landed), "+
+				"availability_error when the sold-out check failed, plus order_id, total_items and total_price, "+
 				"and reopened_order_id when it reopened an order. "+
 				"Empty lists are omitted. "+
 				"If order_id is given and it is not the active order (no order is active, or a different one is), "+

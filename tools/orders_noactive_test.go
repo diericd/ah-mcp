@@ -195,7 +195,10 @@ func otherOrderServer(t *testing.T, reopenFails bool) (srv *httptest.Server, mut
 				})
 				return
 			}
-			written = append(written, r.Header.Get("appie-current-order-id"))
+			// The sold-out check after a write is a read, not a mutation.
+			if strings.Contains(string(body), "basketItemsUpdate") {
+				written = append(written, r.Header.Get("appie-current-order-id"))
+			}
 			json.NewEncoder(w).Encode(map[string]any{
 				"data": map[string]any{"basketItemsUpdate": map[string]any{"__typename": "Basket"}},
 			})
