@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 
 	appie "github.com/gwillem/appie-go"
@@ -50,6 +52,8 @@ type Deps struct {
 	IsAuthenticated func() bool
 	// StartOAuthFlow starts the proxy and returns (loginURL, doneChan, err).
 	StartOAuthFlow func(ctx context.Context) (string, <-chan error, error)
+	// ExchangeCode trades an AH login code for tokens and saves them to TokensPath.
+	ExchangeCode func(ctx context.Context, code string) error
 	// RefreshIfNeeded refreshes the access token if it is close to expiry.
 	RefreshIfNeeded func(ctx context.Context) error
 	// TokenStatus describes the token file at TokensPath (missing, no refresh token, ...). Nil omits it.
@@ -98,11 +102,16 @@ func RegisterLoginTool(s *server.MCPServer, deps Deps) {
 			"Log in to Albert Heijn. "+
 				"Local mode: opens your browser automatically and waits — returns success once you log in (single call). "+
 				"Remote mode: returns a URL to open manually, then call ah_login again to confirm. "+
-				"Already authenticated? Returns your name immediately.",
+				"Already authenticated? Returns your name immediately. "+
+				"If the captcha does not load through the local proxy, log in at "+directLoginURL+" in a normal browser "+
+				"and pass the code from the final appie://login-exit?code=... redirect (or that whole URL) as code.",
+		),
+		mcp.WithString("code",
+			mcp.Description("Optional login code, or the appie://login-exit?code=... URL, from a login on login.ah.be. Skips the proxy and logs in again even when already logged in."),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		return handleLogin(ctx, deps)
+		return handleLogin(ctx, deps, req.GetString("code", ""))
 	})
 }
 
@@ -144,7 +153,51 @@ func loginSuccess(ctx context.Context, deps Deps) (*mcp.CallToolResult, error) {
 	return mcp.NewToolResultText(fmt.Sprintf("Login successful! Connected as %s %s.", member.FirstName, member.LastName)), nil
 }
 
-func handleLogin(ctx context.Context, deps Deps) (*mcp.CallToolResult, error) {
+// directLoginURL is the AH Belgium login page without the local proxy.
+const directLoginURL = "https://login.ah.be/login/nl-BE?client_id=appie-be-ios&response_type=code&redirect_uri=appie://login-exit"
+
+// extractLoginCode returns the login code from a bare code or an
+// appie://login-exit?code=... URL (plain or URL-encoded), or "".
+func extractLoginCode(s string) string {
+	s = strings.TrimSpace(s)
+	if dec, err := url.QueryUnescape(s); err == nil {
+		s = dec
+	}
+	if !strings.Contains(s, "://") && !strings.Contains(s, "?") {
+		return s
+	}
+	i := strings.Index(s, "code=")
+	if i < 0 {
+		return ""
+	}
+	code := s[i+len("code="):]
+	if j := strings.IndexAny(code, "&#"); j >= 0 {
+		code = code[:j]
+	}
+	return code
+}
+
+func loginWithCode(ctx context.Context, deps Deps, input string) (*mcp.CallToolResult, error) {
+	code := extractLoginCode(input)
+	if code == "" {
+		return errResult("No login code found. Pass the code or the appie://login-exit?code=... URL."), nil
+	}
+	if deps.ExchangeCode == nil {
+		return errResult("Login with a code is not available in this server."), nil
+	}
+	if err := deps.ExchangeCode(ctx, code); err != nil {
+		return errResult(fmt.Sprintf("Login failed: %v (codes are single-use and expire quickly; log in again for a new one)", err)), nil
+	}
+	oauthFlow.Lock()
+	oauthFlow.active = false
+	oauthFlow.Unlock()
+	return loginSuccess(ctx, deps)
+}
+
+func handleLogin(ctx context.Context, deps Deps, code string) (*mcp.CallToolResult, error) {
+	if code != "" {
+		return loginWithCode(ctx, deps, code)
+	}
 	// Already authenticated — report immediately.
 	if deps.IsAuthenticated() {
 		c, err := deps.GetClient()
@@ -174,8 +227,9 @@ func handleLogin(ctx context.Context, deps Deps) (*mcp.CallToolResult, error) {
 			url := oauthFlow.loginURL
 			oauthFlow.Unlock()
 			return mcp.NewToolResultText(fmt.Sprintf(
-				"Still waiting for browser login. Please open this URL if you haven't yet:\n\n%s\n\nThen call ah_login again to confirm.",
-				url,
+				"Still waiting for browser login. Please open this URL if you haven't yet:\n\n%s\n\nThen call ah_login again to confirm. "+
+					"If the captcha does not load, log in at %s and call ah_login with code set to the appie://login-exit?code=... URL.",
+				url, directLoginURL,
 			)), nil
 		}
 	}
