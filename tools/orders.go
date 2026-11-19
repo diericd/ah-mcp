@@ -688,6 +688,8 @@ func registerGetCart(s *server.MCPServer, deps Deps) {
 				"with name, quantity, price_before_bonus, current_price (bonus price, absent when "+
 				"the discount applies per group such as \"2e gratis\"), is_bonus and bonus_mechanism. "+
 				"Lines without price fields could not be matched to the order details. "+
+				"Lines with web_only true are BE web-only products (wiNNNNNN): the order omits them, the basket "+
+				"holds them for delivery, and they count in total_price; their price_before_bonus is the unit price. "+
 				"unavailable lists basket lines AH will not deliver, each with product_id, name, quantity and reason: "+
 				"sold_out (\"Tijdelijk uitverkocht\", still in items) or store_only (\"Alleen in de winkel\", not in items). "+
 				"It is omitted when every line is deliverable or the check failed. "+
@@ -723,6 +725,9 @@ func registerGetCart(s *server.MCPServer, deps Deps) {
 			Name      string `json:"name,omitempty"`
 			Quantity  int    `json:"quantity"`
 			*linePrice
+			// WebOnly marks a BE web-only line: the order endpoints omit it,
+			// only the gql basket lists it, and it counts in total_price.
+			WebOnly bool `json:"web_only,omitempty"`
 		}
 		type cartResult struct {
 			ID            string                    `json:"id"`
@@ -742,11 +747,28 @@ func registerGetCart(s *server.MCPServer, deps Deps) {
 			}
 			items = append(items, ci)
 		}
-		// The order summary lists sold-out lines like any other; only the gql
-		// basket flags them. A failed check leaves the cart as it was.
-		unavailable, err := c.GetBasketUnavailable(ctx)
+		// The order summary lists sold-out lines like any other and omits BE
+		// web-only lines; only the gql basket shows both. A failed basket read
+		// leaves the cart as the order reports it.
+		var unavailable []appie.BasketUnavailable
+		basket, err := c.GetBasket(ctx)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[Albert Heijn MCP] Warning: no availability check for cart: %v\n", err)
+			fmt.Fprintf(os.Stderr, "[Albert Heijn MCP] Warning: no basket check for cart: %v\n", err)
+		} else {
+			unavailable = appie.UnavailableLines(basket)
+			for _, b := range appie.WebOnlyLines(basket, order) {
+				name := b.Title
+				if b.UnitSize != "" {
+					name += " " + b.UnitSize
+				}
+				items = append(items, cartItem{
+					ProductID: b.ProductID,
+					Name:      name,
+					Quantity:  b.Quantity,
+					linePrice: &linePrice{PriceBeforeBonus: b.Price},
+					WebOnly:   true,
+				})
+			}
 		}
 		return jsonResult(cartResult{
 			ID:            order.ID,
@@ -1043,7 +1065,7 @@ func registerUpdateOrderItems(s *server.MCPServer, deps Deps) {
 				"Set quantity=0 to remove an item. "+
 				"Use after ah_reopen_order to edit a submitted delivery order. "+
 				"Reads the order back and reports, for the sent product IDs only: "+
-				"landed [{id,qty}], rejected [id] (sent with qty>0 but missing, e.g. not in the delivery slot assortment), "+
+				"landed [{id,qty}], rejected [id] (sent with qty>0 but missing, e.g. not in the delivery slot assortment; a BE web-only id the basket holds counts as landed), "+
 				"qty_mismatch [{id,want,got}], removed [id], "+
 				"sold_out [id] (in the order at the sent qty but \"Tijdelijk uitverkocht\", so not delivered; not in landed), "+
 				"availability_error when the sold-out check failed, plus order_id, total_items and total_price, "+
