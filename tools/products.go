@@ -40,7 +40,8 @@ func registerSearchProducts(s *server.MCPServer, deps Deps) {
 				"e.g. 'melk' (milk), 'kaas' (cheese), 'brood' (bread), 'kip' (chicken), 'appel' (apple). "+
 				"English terms also work but may return fewer results. "+
 				"Returns id, title, price, bonus_price, unit, is_bonus, bonus_mechanism, is_available, is_orderable, previously_bought (omitted when false), and image_url when include_images=true. "+
-				"Neither is_available nor is_orderable guarantees the item is in stock for the delivery slot.",
+				"Neither is_available nor is_orderable guarantees the item is in stock for the delivery slot. "+
+				assortmentNote,
 		),
 		mcp.WithString("query",
 			mcp.Required(),
@@ -96,6 +97,7 @@ func registerSearchProducts(s *server.MCPServer, deps Deps) {
 		for _, p := range products {
 			results = append(results, newProductItem(p, includeImages))
 		}
+		annotateItems(ctx, c, results)
 		data, err := json.Marshal(results)
 		if err != nil {
 			return errResult(fmt.Sprintf("marshal result: %v", err)), nil
@@ -155,6 +157,7 @@ func registerGetBonusGroupProducts(s *server.MCPServer, deps Deps) {
 		for _, p := range products {
 			results = append(results, newProductItem(p, includeImages))
 		}
+		annotateItems(ctx, c, results)
 		return jsonResult(results)
 	})
 }
@@ -170,13 +173,18 @@ func registerGetBonusOffers(s *server.MCPServer, deps Deps) {
 				"Supports optional keyword filter to find e.g. cheese on bonus: set query='kaas'. "+
 				"Group deals (e.g. '2+1 gratis', 'Alle yoghurt 25% korting') have id=0 and a non-empty bonus_segment_id — "+
 				"pass that to ah_get_bonus_group_products to see the individual products in the group. "+
-				"Returns id, bonus_segment_id, title, original_price, bonus_price, discount_percentage, bonus_mechanism.",
+				"Returns id, bonus_segment_id, title, original_price, bonus_price, discount_percentage, bonus_mechanism. "+
+				"The bonus feed is the Dutch national one: single products outside the Belgian assortment are dropped "+
+				"unless include_non_be=true (then in_be_assortment marks them). Group deals (id 0) are not checked.",
 		),
 		mcp.WithNumber("limit",
 			mcp.Description("Maximum number of results to return (default 20)"),
 		),
 		mcp.WithString("query",
 			mcp.Description("Optional keyword filter (Dutch or English) applied client-side, e.g. 'kaas', 'vlees', 'bier'"),
+		),
+		mcp.WithBoolean("include_non_be",
+			mcp.Description("Keep single products outside the Belgian assortment (default false)"),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -217,14 +225,28 @@ func registerGetBonusOffers(s *server.MCPServer, deps Deps) {
 			BonusPrice         float64 `json:"bonus_price"`
 			DiscountPercentage float64 `json:"discount_percentage,omitempty"`
 			BonusMechanism     string  `json:"bonus_mechanism,omitempty"`
+			InBEAssortment     *bool   `json:"in_be_assortment,omitempty"`
 		}
-		results := make([]item, 0)
+		includeNonBE := req.GetBool("include_non_be", false)
+		// Client-side keyword filter when query is set.
+		matched := products[:0:0]
 		for _, p := range products {
+			if query == "" || strings.Contains(strings.ToLower(p.Title), query) {
+				matched = append(matched, p)
+			}
+		}
+		ids := make([]int, 0, len(matched))
+		for _, p := range matched {
+			ids = append(ids, p.ID)
+		}
+		flags := lookupAssortment(ctx, c, ids)
+		results := make([]item, 0)
+		for _, p := range matched {
 			if len(results) >= limit {
 				break
 			}
-			// Client-side keyword filter when query is set.
-			if query != "" && !strings.Contains(strings.ToLower(p.Title), query) {
+			in, known := flags[p.ID]
+			if known && !in && !includeNonBE {
 				continue
 			}
 			it := item{
@@ -234,6 +256,9 @@ func registerGetBonusOffers(s *server.MCPServer, deps Deps) {
 				OriginalPrice:  p.Price.Was,
 				BonusPrice:     p.Price.Now,
 				BonusMechanism: p.BonusMechanism,
+			}
+			if known {
+				it.InBEAssortment = &in
 			}
 			it.DiscountPercentage = discountPercentage(p.Price.Was, p.Price.Now)
 			results = append(results, it)
@@ -371,6 +396,7 @@ type productItem struct {
 	IsOrderable      bool    `json:"is_orderable"`
 	PreviouslyBought bool    `json:"previously_bought,omitempty"`
 	ImageURL         string  `json:"image_url,omitempty"`
+	InBEAssortment   *bool   `json:"in_be_assortment,omitempty"`
 }
 
 // newProductItem builds a productItem. Image URLs are long and rarely needed,
@@ -434,6 +460,9 @@ type bulkProduct struct {
 	Description      string      `json:"description,omitempty"`
 	ZelfToevoegen    string      `json:"zelf_toevoegen,omitempty"`
 	NutritionalInfo  interface{} `json:"nutritional_info,omitempty"`
+	InBEAssortment   *bool       `json:"in_be_assortment,omitempty"`
+	WebOnly          bool        `json:"web_only,omitempty"`
+	WebPath          string      `json:"web_path,omitempty"`
 	Error            string      `json:"error,omitempty"`
 }
 
@@ -453,6 +482,8 @@ func newBulkProduct(p *appie.Product, includeNutri bool) bulkProduct {
 		PropertyIcons:    p.PropertyIcons,
 		Description:      p.ShortDescription,
 		ZelfToevoegen:    p.SelfAdd,
+		InBEAssortment:   p.InAssortment,
+		WebPath:          p.WebPath,
 	}
 	pr.Price, pr.BonusPrice = splitPrice(*p)
 	if includeNutri && len(p.NutritionalInfo) > 0 {
@@ -484,7 +515,8 @@ func registerSearchProductsBulk(s *server.MCPServer, deps Deps) {
 			"Search for multiple products in one tool call. "+
 				"Pass a JSON array of search queries; results for all are returned together. "+
 				"Use this instead of calling ah_search_products repeatedly — saves tool-call quota. "+
-				"Max 10 queries per call. Dutch terms give best results.",
+				"Max 10 queries per call. Dutch terms give best results. "+
+				assortmentNote,
 		),
 		mcp.WithArray("queries",
 			mcp.Required(),
@@ -579,6 +611,7 @@ func registerSearchProductsBulk(s *server.MCPServer, deps Deps) {
 				for _, p := range products {
 					items = append(items, newProductItem(p, includeImages))
 				}
+				annotateItems(ctx, c, items)
 				results[i].Results = items
 
 				// Store in cache so single-search calls also benefit. An empty
@@ -609,6 +642,9 @@ func registerGetProductsBulk(s *server.MCPServer, deps Deps) {
 				"Optionally include nutritional info (calories, fat, protein, etc.) for all products. "+
 				"Returns the same availability flags and property_icons as ah_get_product, plus description "+
 				"and zelf_toevoegen (a meal kit's 'Zelf toevoegen' text: the extras to buy). "+
+				"BE-only ids (wiNNNNNN on ah.be, absent from the Dutch REST catalog) resolve through the gql gateway "+
+				"with web_only true, web_path, title, unit_size, category and BE price, but no images, nutrition or bonus. "+
+				assortmentNote+
 				"Max 20 product IDs per call.",
 		),
 		mcp.WithArray("product_ids",
@@ -704,13 +740,10 @@ func registerGetProductsBulk(s *server.MCPServer, deps Deps) {
 				defer func() { <-sem }()
 
 				var p *appie.Product
+				var webOnly bool
 				if err := withRetry(ctx, "ah_get_products_bulk", func() error {
 					var e error
-					if includeNutri {
-						p, e = c.GetProductFull(ctx, pid)
-					} else {
-						p, e = c.GetProduct(ctx, pid)
-					}
+					p, webOnly, e = getProductOrGQL(ctx, c, pid, includeNutri)
 					return e
 				}); err != nil {
 					results[i].Error = err.Error()
@@ -718,6 +751,7 @@ func registerGetProductsBulk(s *server.MCPServer, deps Deps) {
 				}
 
 				pr := newBulkProduct(p, includeNutri)
+				pr.WebOnly = webOnly
 				results[i] = pr
 
 				if data, err := json.Marshal(pr); err == nil {
@@ -726,6 +760,22 @@ func registerGetProductsBulk(s *server.MCPServer, deps Deps) {
 			}()
 		}
 		wg.Wait()
+
+		// Cached entries keep their flag; fill it for the rest.
+		var unflagged []int
+		for _, r := range results {
+			if r.Error == "" && r.InBEAssortment == nil {
+				unflagged = append(unflagged, r.ID)
+			}
+		}
+		if len(unflagged) > 0 {
+			flags := lookupAssortment(ctx, c, unflagged)
+			for i := range results {
+				if in, ok := flags[results[i].ID]; ok && results[i].InBEAssortment == nil {
+					results[i].InBEAssortment = &in
+				}
+			}
+		}
 
 		LogInfo("ah_get_products_bulk", "ids=%d nutri=%v duration=%v", len(productIDs), includeNutri, time.Since(start))
 		return jsonResult(results)
@@ -838,6 +888,8 @@ func registerGetProduct(s *server.MCPServer, deps Deps) {
 			"Get detailed information about a single Albert Heijn product by ID. "+
 				"Returns title, brand, category, description, price, unit size, bonus info, NutriScore, property icons, is_available, is_orderable, previously_bought. "+
 				"Set include_nutritional_info=true to also return calories, fat, protein, etc. "+
+				"A BE-only id (wiNNNNNN on ah.be) resolves through the gql gateway with web_only true and web_path. "+
+				assortmentNote+
 				"Get product_id from ah_search_products.",
 		),
 		mcp.WithNumber("product_id",
@@ -882,13 +934,10 @@ func registerGetProduct(s *server.MCPServer, deps Deps) {
 		}
 
 		var p *appie.Product
+		var webOnly bool
 		if err := withRetry(ctx, "ah_get_product", func() error {
 			var e error
-			if includeNutri {
-				p, e = c.GetProductFull(ctx, productID)
-			} else {
-				p, e = c.GetProduct(ctx, productID)
-			}
+			p, webOnly, e = getProductOrGQL(ctx, c, productID, includeNutri)
 			return e
 		}); err != nil {
 			LogError("ah_get_product", "failed id=%d err=%v", productID, err)
@@ -915,6 +964,9 @@ func registerGetProduct(s *server.MCPServer, deps Deps) {
 			ZelfToevoegen        string      `json:"zelf_toevoegen,omitempty"`
 			NutritionalInfo      interface{} `json:"nutritional_info,omitempty"`
 			ImageURL             string      `json:"image_url,omitempty"`
+			InBEAssortment       *bool       `json:"in_be_assortment,omitempty"`
+			WebOnly              bool        `json:"web_only,omitempty"`
+			WebPath              string      `json:"web_path,omitempty"`
 		}
 		r := result{
 			ID:                   p.ID,
@@ -932,6 +984,14 @@ func registerGetProduct(s *server.MCPServer, deps Deps) {
 			UnitPriceDescription: p.UnitPriceDescription,
 			PropertyIcons:        p.PropertyIcons,
 			ZelfToevoegen:        p.SelfAdd,
+			InBEAssortment:       p.InAssortment,
+			WebOnly:              webOnly,
+			WebPath:              p.WebPath,
+		}
+		if r.InBEAssortment == nil {
+			if in, ok := lookupAssortment(ctx, c, []int{p.ID})[p.ID]; ok {
+				r.InBEAssortment = &in
+			}
 		}
 		r.Price, r.BonusPrice = splitPrice(*p)
 		if len(p.Images) > 0 {
@@ -1010,6 +1070,7 @@ func registerSearchProductsFiltered(s *server.MCPServer, deps Deps) {
 		for _, p := range products {
 			results = append(results, newProductItem(p, includeImages))
 		}
+		annotateItems(ctx, c, results)
 		return jsonResult(results)
 	})
 }
