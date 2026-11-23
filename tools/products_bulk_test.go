@@ -1,11 +1,15 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -18,7 +22,14 @@ import (
 // runProductTool registers a tool against a fake AH server and runs it once.
 func runProductTool(t *testing.T, h http.HandlerFunc, register func(*server.MCPServer, Deps), name string, args map[string]any) string {
 	t.Helper()
-	srv := httptest.NewServer(h)
+	return runProductToolBE(t, h, nil, register, name, args)
+}
+
+// runProductToolBE is runProductTool with the ids in notInBE outside the
+// Belgian assortment.
+func runProductToolBE(t *testing.T, h http.HandlerFunc, notInBE map[int]bool, register func(*server.MCPServer, Deps), name string, args map[string]any) string {
+	t.Helper()
+	srv := httptest.NewServer(withAssortment(h, notInBE))
 	t.Cleanup(srv.Close)
 
 	client := appie.New(appie.WithBaseURL(srv.URL), appie.WithTokens("test", "test"))
@@ -65,43 +76,62 @@ func TestGetProductsBulkBatchesMissesAndFallsBack(t *testing.T) {
 		case strings.HasPrefix(r.URL.Path, "/mobile-services/product/detail/v4/fir/"):
 			detailPaths = append(detailPaths, r.URL.Path)
 			http.Error(w, "not found", http.StatusNotFound)
+		case r.URL.Path == "/graphql":
+			// The gql gateway resolves BE-only id 3; id 5 exists nowhere.
+			body, _ := io.ReadAll(r.Body)
+			if strings.Contains(string(body), "product(id: 3)") {
+				json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"product": map[string]any{
+					"id": 3, "title": "AH Witlof", "salesUnitSize": "500 g", "webPath": "/producten/product/wi3/ah-witlof",
+					"taxonomies": []map[string]any{{"id": 21611}}, "price": map[string]any{"now": map[string]any{"amount": 3.79}},
+				}}})
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{"data": nil, "errors": []map[string]any{{"message": "Subgraph errors redacted"}}})
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)
 		}
 	}
 
 	text := runProductTool(t, h, registerGetProductsBulk, "ah_get_products_bulk",
-		map[string]any{"product_ids": []any{float64(1), float64(2), float64(3), float64(4)}})
+		map[string]any{"product_ids": []any{float64(1), float64(2), float64(3), float64(4), float64(5)}})
 
 	var got []bulkProduct
 	if err := json.Unmarshal([]byte(text), &got); err != nil {
 		t.Fatalf("decode %q: %v", text, err)
 	}
-	if len(got) != 4 {
-		t.Fatalf("got %d results, want 4: %s", len(got), text)
+	if len(got) != 5 {
+		t.Fatalf("got %d results, want 5: %s", len(got), text)
 	}
 	want := []struct {
 		id    int
 		title string
-	}{{1, "One"}, {2, "Two"}, {3, ""}, {4, "Cached"}}
+	}{{1, "One"}, {2, "Two"}, {3, "AH Witlof"}, {4, "Cached"}, {5, ""}}
 	for i, w := range want {
 		if got[i].ID != w.id || got[i].Title != w.title {
 			t.Errorf("result %d = {%d %q}, want {%d %q}", i, got[i].ID, got[i].Title, w.id, w.title)
 		}
 	}
-	if got[2].Error == "" {
-		t.Errorf("missing id 3 should carry a per-item error: %+v", got[2])
+	if got[2].Error != "" || !got[2].WebOnly || got[2].WebPath == "" || got[2].Price != 3.79 ||
+		got[2].InBEAssortment == nil || !*got[2].InBEAssortment {
+		t.Errorf("BE-only id 3 should resolve through gql: %+v", got[2])
 	}
-	if got[0].Error != "" || got[1].Error != "" {
-		t.Errorf("batched ids should have no error: %+v", got[:2])
+	if got[4].Error == "" {
+		t.Errorf("unknown id 5 should carry a per-item error: %+v", got[4])
+	}
+	if got[0].Error != "" || got[1].Error != "" || got[0].WebOnly {
+		t.Errorf("batched ids should have no error and not be web-only: %+v", got[:2])
+	}
+	if got[0].InBEAssortment == nil || !*got[0].InBEAssortment {
+		t.Errorf("batched ids should carry in_be_assortment: %+v", got[0])
 	}
 
 	slices.Sort(batchIDs)
-	if !slices.Equal(batchIDs, []string{"1", "2", "3"}) {
-		t.Errorf("batch ids = %v, want only the cache misses [1 2 3]", batchIDs)
+	if !slices.Equal(batchIDs, []string{"1", "2", "3", "5"}) {
+		t.Errorf("batch ids = %v, want only the cache misses [1 2 3 5]", batchIDs)
 	}
-	if !slices.Equal(detailPaths, []string{"/mobile-services/product/detail/v4/fir/3"}) {
-		t.Errorf("detail calls = %v, want only the id missing from the batch", detailPaths)
+	slices.Sort(detailPaths)
+	if !slices.Equal(detailPaths, []string{"/mobile-services/product/detail/v4/fir/3", "/mobile-services/product/detail/v4/fir/5"}) {
+		t.Errorf("detail calls = %v, want only the ids missing from the batch", detailPaths)
 	}
 	if _, ok := GlobalCache.Get(BulkProductCacheKey(1)); !ok {
 		t.Error("batched product 1 was not cached")
@@ -261,5 +291,35 @@ func TestGetProductsBulkReturnsKitSelfAdd(t *testing.T) {
 	}
 	if got[0].Description != "Koreaanse bowl.\nvoor 2-3 personen\nZelf toevoegen: 195 g kipdijfilet, 4 el mayonaise" {
 		t.Errorf("description = %q", got[0].Description)
+	}
+}
+
+var assortmentAliasRe = regexp.MustCompile(`p(\d+): product\(id: \d+\)`)
+
+// withAssortment answers the gql assortment check in front of h: every id is in
+// the Belgian assortment except those in notInBE. Other requests go to h.
+func withAssortment(h http.HandlerFunc, notInBE map[int]bool) http.HandlerFunc {
+	GlobalCache.Invalidate("assortment")
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/graphql" {
+			h(w, r)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), "query Assortment") {
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			h(w, r)
+			return
+		}
+		data := map[string]any{}
+		for _, m := range assortmentAliasRe.FindAllStringSubmatch(string(body), -1) {
+			id, _ := strconv.Atoi(m[1])
+			var tax any = []map[string]any{{"id": 1}}
+			if notInBE[id] {
+				tax = nil
+			}
+			data["p"+m[1]] = map[string]any{"taxonomies": tax}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"data": data})
 	}
 }
