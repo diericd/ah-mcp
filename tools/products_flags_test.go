@@ -64,3 +64,24 @@ func TestBonusDealWithoutWasPrice(t *testing.T) {
 		}
 	}
 }
+
+func TestNewProductItemMarksBEOnly(t *testing.T) {
+	in := true
+	web := appie.Product{ID: 565848, Title: "AH Witlof", WebPath: "/producten/product/wi565848/ah-witlof", InAssortment: &in}
+	got, err := json.Marshal(newProductItem(web, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"web_only":true`, `"web_path":"/producten/product/wi565848/ah-witlof"`, `"in_be_assortment":true`} {
+		if !strings.Contains(string(got), want) {
+			t.Errorf("missing %s in %s", want, got)
+		}
+	}
+	rest, err := json.Marshal(newProductItem(appie.Product{ID: 238834, Title: "AH Witlof"}, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rest), "web_only") {
+		t.Errorf("REST product marked web_only: %s", rest)
+	}
+}

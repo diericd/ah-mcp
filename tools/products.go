@@ -397,6 +397,8 @@ type productItem struct {
 	PreviouslyBought bool    `json:"previously_bought,omitempty"`
 	ImageURL         string  `json:"image_url,omitempty"`
 	InBEAssortment   *bool   `json:"in_be_assortment,omitempty"`
+	WebOnly          bool    `json:"web_only,omitempty"`
+	WebPath          string  `json:"web_path,omitempty"`
 }
 
 // newProductItem builds a productItem. Image URLs are long and rarely needed,
@@ -411,6 +413,10 @@ func newProductItem(p appie.Product, includeImages bool) productItem {
 		IsAvailable:      p.IsAvailable,
 		IsOrderable:      p.IsOrderable,
 		PreviouslyBought: p.IsPreviouslyBought,
+		InBEAssortment:   p.InAssortment,
+		// Only the gql fallback fills WebPath: the REST catalog lacks the id.
+		WebOnly: p.WebPath != "",
+		WebPath: p.WebPath,
 	}
 	it.Price, it.BonusPrice = splitPrice(p)
 	if includeImages && len(p.Images) > 0 {

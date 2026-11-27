@@ -30,8 +30,9 @@ func GetClient() (*appie.Client, error) {
 func ReloadClient() (*appie.Client, error) {
 	path := TokensPath()
 	// BE: data calls must send the Belgian client id (x-client-name header),
-	// otherwise the NL default "appie-ios" is used.
-	c, err := appie.NewWithConfig(path, appie.WithClientID(ahClientID))
+	// otherwise the NL default "appie-ios" is used. The nl_BE locale makes
+	// product search return the Belgian webshop list, BE-only products included.
+	c, err := appie.NewWithConfig(path, appie.WithClientID(ahClientID), appie.WithLocale("nl_BE"))
 	if err != nil {
 		return nil, fmt.Errorf("create appie client: %w", err)
 	}
