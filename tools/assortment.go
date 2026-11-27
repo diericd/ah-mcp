@@ -9,7 +9,8 @@ import (
 
 // assortmentNote is the shared tool-description text for in_be_assortment.
 const assortmentNote = "in_be_assortment is false for products outside the Belgian assortment " +
-	"(the delivery slot rejects them; the search catalog is Dutch) and absent when the check failed. "
+	"(the delivery slot rejects them) and absent when the check failed. " +
+	"Search returns the ah.be list: BE-only products come with web_only true and web_path, without images or bonus. "
 
 // assortmentCacheKey caches one product's assortment flag.
 func assortmentCacheKey(id int) string { return fmt.Sprintf("assortment:%d", id) }
